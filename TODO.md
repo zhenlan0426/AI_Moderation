@@ -2,4 +2,5 @@
 - to use subreddit or not
 - rules + positive/negative examples + test examples, backprop from positive/negative examples and keep track of test example logit predictions
 - text normalization
-- data2 and data3 needs to be split into positive/negative examples
+- ✅ data2 and data3 needs to be split into positive/negative examples
+- iterative data cleaning. top false positives and false negatives by model -> GPT rerate GT -> retrain model -> repeat

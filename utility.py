@@ -2,15 +2,20 @@
 Utility functions for text normalization used in the AI_Moderation project.
 
 Currently includes:
-1. normalize_urls      – Replace URLs with placeholder <URL_{domain}> (domain kept).
-2. normalize_usernames – Replace Reddit and @-style user mentions with <USER>.
-3. normalize_text      – Convenience wrapper that applies both.
+1. normalize_urls        – Replace URLs with placeholder <URL_{domain}> (domain kept).
+2. normalize_usernames   – Replace Reddit and @-style user mentions with <USER>.
+3. normalize_emails      – Replace email addresses with <EMAIL>.
+4. normalize_subreddits  – Replace subreddit mentions (r/…) with <SUB>.
+5. normalize_phone_numbers – Replace phone numbers with <PHONE>.
+6. normalize_money       – Replace dollar amounts with <MONEY>.
+7. normalize_text        – Convenience wrapper that applies all of the above.
 
 Rationale
 ---------
-• Exact URLs and user names rarely matter for rule-violation classification, but the presence of a link and the domain often do.
-• Keeping only the domain reduces vocabulary size while retaining potentially useful signal (e.g., youtube.com vs twitter.com).
-• Replacing user mentions removes nearly-unique identifiers that otherwise bloat the tokenizer’s sub-word vocabulary.
+• Exact URLs, user names, emails, phone numbers, and specific dollar amounts rarely matter for rule-violation classification.
+• Keeping only the domain for URLs reduces vocabulary size while retaining potentially useful signal (e.g., youtube.com vs twitter.com).
+• Replacing personal identifiers removes nearly-unique tokens that otherwise bloat the tokenizer's sub-word vocabulary.
+• This normalization helps models generalize better by focusing on content patterns rather than specific identifiers.
 """
 from __future__ import annotations
 
@@ -19,7 +24,11 @@ from urllib.parse import urlparse
 
 __all__ = [
     "normalize_urls",
-    "normalize_usernames",
+    "normalize_usernames", 
+    "normalize_emails",
+    "normalize_subreddits",
+    "normalize_phone_numbers",
+    "normalize_money",
     "normalize_text",
 ]
 
@@ -38,6 +47,35 @@ _REDDIT_USER_RE: re.Pattern[str] = re.compile(r"(?<!\w)/?u/[A-Za-z0-9_-]+", flag
 
 # @username mentions – capped at 30 chars, avoids picking up email addresses
 _AT_USER_RE: re.Pattern[str] = re.compile(r"(?<!\w)@[A-Za-z0-9_]{1,30}\b")
+
+# Email addresses
+_EMAIL_RE: re.Pattern[str] = re.compile(
+    r"\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}\b",
+    flags=re.IGNORECASE,
+)
+
+# Reddit subreddit mentions: r/subreddit or /r/subreddit (case-insensitive)
+_SUBREDDIT_RE: re.Pattern[str] = re.compile(r"(?<!\w)/?r/[A-Za-z0-9_-]+", flags=re.IGNORECASE)
+
+# Phone numbers - various formats
+_PHONE_RE: re.Pattern[str] = re.compile(
+    r"(?:\+?1[-.\s]?)?\(?[0-9]{3}\)?[-.\s]?[0-9]{3}[-.\s]?[0-9]{4}|"  # US phone numbers
+    r"1-800-[A-Z0-9-]+",  # 1-800 numbers with letters
+    flags=re.IGNORECASE,
+)
+
+# Money amounts - currency symbols (e.g., "$1,000", "£50", "€3.2M") OR numeric/placeholder amounts followed by currency words
+_MONEY_RE: re.Pattern[str] = re.compile(
+    r'''(
+        [\$£€]                              # Currency symbols
+        [0-9]+(?:[,.][0-9]+)*                # Amount with optional separators
+        (?:\s*(?:million|billion|k|M|B))?    # Optional scale/abbreviation
+        |                                     # OR
+        (?:[0-9]+|[Xx]{2,})\s*              # Number or placeholder
+        (?:dollars?|pounds?|euros?)          # Currency words
+    )''',
+    flags=re.IGNORECASE | re.VERBOSE,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -75,10 +113,34 @@ def normalize_usernames(text: str) -> str:
     return text
 
 
+def normalize_emails(text: str) -> str:
+    """Replace email addresses with ``<EMAIL>``."""
+    return _EMAIL_RE.sub("<EMAIL>", text)
+
+
+def normalize_subreddits(text: str) -> str:
+    """Replace subreddit mentions (r/subreddit) with ``<SUB>``."""
+    return _SUBREDDIT_RE.sub("<SUB>", text)
+
+
+def normalize_phone_numbers(text: str) -> str:
+    """Replace phone numbers with ``<PHONE>``."""
+    return _PHONE_RE.sub("<PHONE>", text)
+
+
+def normalize_money(text: str) -> str:
+    """Replace money amounts (dollar, pound, euro, etc.) with ``<MONEY>``."""
+    return _MONEY_RE.sub("<MONEY>", text)
+
+
 def normalize_text(text: str) -> str:
-    """Cascade of :pyfunc:`normalize_urls` then :pyfunc:`normalize_usernames`."""
+    """Apply all normalization functions in sequence."""
     text = normalize_urls(text)
     text = normalize_usernames(text)
+    text = normalize_emails(text)
+    # text = normalize_subreddits(text)
+    text = normalize_phone_numbers(text)
+    text = normalize_money(text)
     return text
 
 
@@ -89,6 +151,8 @@ def normalize_text(text: str) -> str:
 if __name__ == "__main__":
     sample = (
         "Check https://www.reddit.com/r/python by u/someone, "
-        "see www.example.com/foo and say hi to @Friend!"
+        "email me at kingfavoursolutiontemple@yahoo.com or visit www.example.com/foo, "
+        "call 1-800-99-LAW-USA for $100 discount! Also check r/AskReddit and @friend"
     )
-    print(normalize_text(sample))
+    print("Original:", sample)
+    print("Normalized:", normalize_text(sample))
