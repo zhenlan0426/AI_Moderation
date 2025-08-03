@@ -21,18 +21,13 @@ from __future__ import annotations
 
 import re
 from urllib.parse import urlparse
+import random
+from typing import Dict, List, Sequence
 
-__all__ = [
-    "normalize_urls",
-    "normalize_usernames", 
-    "normalize_emails",
-    "normalize_subreddits",
-    "normalize_phone_numbers",
-    "normalize_money",
-    "normalize_text",
-    "build_rule_example_lookup",
-    "group_examples_by_rule",
-]
+import pandas as pd
+import torch
+from torch.utils.data import Dataset, DataLoader
+
 
 # ---------------------------------------------------------------------------
 # Regex patterns (compiled once at import time)
@@ -149,6 +144,31 @@ def normalize_text(text: str) -> str:
 # ---------------------------------------------------------------------------
 # Data1: Rule-based example aggregation
 # ---------------------------------------------------------------------------
+"""Dataset & DataLoader for Reddit rule-violation classification - Data1.
+
+For every row in the provided DataFrame we create a prompt that follows the
+`ttt_design.md` template:
+
+    You are given a comment on reddit. Your task is to classify if it violates the given rule.
+    Subreddit: r/<subreddit>
+    Rule: <rule text>
+    Comment: <support example 1>
+    Violation: <Yes|No>
+    Comment: <support example 2>
+    Violation: <Yes|No>
+    Comment: <target comment>
+    Violation:
+
+Two labelled *support* examples (one violating, one non-violating) are sampled
+for the same rule. Their order is randomised.  The unlabelled *target* comment
+(the row's own *body*) is appended last – the model must produce an answer
+right after the final "Violation:" token.  To facilitate that, this dataset
+returns the *position* (index) of the first token of the **last** "Violation:"
+string in the tokenised sequence.
+
+The caller can then gather the model's hidden states / logits at this position
+to train a classifier or compute loss directly.
+"""
 
 from typing import Dict, List
 import pandas as pd
@@ -187,16 +207,156 @@ def group_examples_by_rule(df) -> Dict[str, Dict[str, List[str]]]:
         result[rule] = {"positives": pos_examples, "negatives": neg_examples}
     return result
 
+class TTTDataset(Dataset):
+    """PyTorch `Dataset` that yields tokenised TTT prompts.
+
+    Parameters
+    ----------
+    df
+        *Cleaned* DataFrame containing at least the following columns::
+            ["subreddit", "rule", "body", "positive_example_1", "negative_example_1"]
+        Additional columns (e.g. `positive_example_2`) are ignored but allowed.
+
+    grouped_examples
+        Mapping produced by ``utility.group_examples_by_rule`` (or an equivalent
+        function).  The structure must be::
+
+            {rule_text: {"positives": List[str], "negatives": List[str]}}
+
+        The positive / negative pools are used to randomly sample *support*
+        examples for each datum.
+
+    tokenizer
+        Any HuggingFace *PreTrainedTokenizer* instance compatible with your
+        language model.
+
+    max_length
+        Sequence length after padding / truncation.  Defaults to 512.
+
+    Notes
+    -----
+    •  No heavy preprocessing is performed here – we assume `df` has already
+       been cleaned / normalised.
+    •  The dataset is *stateless* w.r.t. sampling order. Every `__getitem__`
+       call produces a fresh prompt, so subsequent epochs will see different
+       support examples / orders by design.
+    """
+
+    violation_str: str = "Violation:"
+
+    def __init__(
+        self,
+        df: pd.DataFrame,
+        grouped_examples: Dict[str, Dict[str, List[str]]],
+        tokenizer
+    ) -> None:
+        super().__init__()
+        self.df = df.reset_index(drop=True)
+        self.grouped_examples = grouped_examples
+        self.tokenizer = tokenizer
+
+
+        # Pre-encode "Violation:" once so we can search for it quickly later.
+        self._violation_ids: torch.Tensor = tokenizer.encode(
+            self.violation_str, add_special_tokens=False, return_tensors="pt"
+        )[0]
+
+    # ---------------------------------------------------------------------
+    # Private helpers
+    # ---------------------------------------------------------------------
+    def _sample_support(self, rule: str) -> tuple[str, str, str, str]:
+        """Return two support comments and their labels (text, label, ...)."""
+        pools = self.grouped_examples[rule]
+        pos_pool: Sequence[str] = pools["positives"]
+        neg_pool: Sequence[str] = pools["negatives"]
+        pos_example = random.choice(pos_pool)
+        neg_example = random.choice(neg_pool)
+        # Randomise order
+        if random.random() < 0.5:
+            return pos_example, "Yes", neg_example, "No"
+        return neg_example, "No", pos_example, "Yes"
+
+    def _build_prompt(self, row: pd.Series) -> str:
+        rule = row["rule"]
+        subreddit = row["subreddit"]
+
+        # Support examples
+        comment1, label1, comment2, label2 = self._sample_support(rule)
+
+        prompt = (
+            "You are given a comment on reddit. Your task is to classify if it violates the given rule.\n"
+            f"Subreddit: r/{subreddit}\n"
+            f"Rule: {rule}\n"
+            f"Comment: {comment1}\n"
+            f"Violation: {label1}\n"
+            f"Comment: {comment2}\n"
+            f"Violation: {label2}\n"
+            f"Comment: {row['body']}\n"
+            f"{self.violation_str}"
+        )
+        labels = torch.tensor([1, 0], dtype=torch.long) if label1 == "Yes" else torch.tensor([0, 1], dtype=torch.long)
+        return prompt, labels
+
+    # ------------------------------------------------------------------
+    # PyTorch Dataset interface
+    # ------------------------------------------------------------------
+    def __len__(self) -> int:  # noqa: D401
+        return len(self.df)
+
+    def __getitem__(self, idx: int):  # noqa: D401
+        row = self.df.iloc[idx]
+        prompt, labels = self._build_prompt(row)
+
+        input_ids = self.tokenizer.encode(
+            prompt,
+            add_special_tokens = True,
+            return_tensors="pt",
+        ).squeeze(0)
+
+        # ------------------------------------------------------------------
+        # Locate the final "Violation:" occurrence – that's where the model
+        # must output its prediction.
+        # ------------------------------------------------------------------
+        vi_index = []
+        seq_len = input_ids.size(0)
+        token_window = len(self._violation_ids)
+
+        # Sliding-window search for *all* occurrences
+        for i in range(seq_len - token_window + 1):
+            if torch.equal(
+                input_ids[i : i + token_window],  # noqa: E203 (black compat)
+                self._violation_ids,
+            ):
+                vi_index.append(i + token_window - 1) # we want the last index to predict yes / no.
+
+
+        return row["row_id"], input_ids.unsqueeze(0), torch.tensor(vi_index), labels
+
 
 # ---------------------------------------------------------------------------
-# Quick sanity test (executes only when run as a script)
+# Convenience DataLoader factory
 # ---------------------------------------------------------------------------
 
-if __name__ == "__main__":
-    sample = (
-        "Check https://www.reddit.com/r/python by u/someone, "
-        "email me at kingfavoursolutiontemple@yahoo.com or visit www.example.com/foo, "
-        "call 1-800-99-LAW-USA for $100 discount! Also check r/AskReddit and @friend"
+def build_dataloader(
+    df: pd.DataFrame,
+    tokenizer,
+    batch_size: int = 1,
+    shuffle: bool = True,
+    num_workers: int = 0,
+    pin_memory: bool = True,
+) -> DataLoader:
+    """Return a ready-to-use PyTorch ``DataLoader`` for TTT training."""
+    dataset = TTTDataset(
+        df=df,
+        grouped_examples=group_examples_by_rule(df),
+        tokenizer=tokenizer,
     )
-    print("Original:", sample)
-    print("Normalized:", normalize_text(sample))
+
+    return DataLoader(
+        dataset,
+        batch_size=batch_size,
+        shuffle=shuffle,
+        num_workers=num_workers,
+        pin_memory=pin_memory,
+        collate_fn=lambda x:x[0] # only works for batch size one
+    )
