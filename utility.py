@@ -30,6 +30,8 @@ __all__ = [
     "normalize_phone_numbers",
     "normalize_money",
     "normalize_text",
+    "build_rule_example_lookup",
+    "group_examples_by_rule",
 ]
 
 # ---------------------------------------------------------------------------
@@ -142,6 +144,48 @@ def normalize_text(text: str) -> str:
     text = normalize_phone_numbers(text)
     text = normalize_money(text)
     return text
+
+
+# ---------------------------------------------------------------------------
+# Data1: Rule-based example aggregation
+# ---------------------------------------------------------------------------
+
+from typing import Dict, List
+import pandas as pd
+
+def group_examples_by_rule(df) -> Dict[str, Dict[str, List[str]]]:
+    """Return deduplicated positive/negative lists per rule without any I/O or heavy normalisation.
+
+    Parameters
+    ----------
+    df : pandas.DataFrame
+        Pre-cleaned DataFrame containing the Data1 training rows.
+    (Assumed to already include the relevant columns and be cleaned.)
+
+    Returns
+    -------
+    dict
+        Mapping ``{rule_text: {"positives": [...], "negatives": [...]}}``.
+    """
+
+
+    # Column names for positive and negative example sets
+    pos_cols = ["positive_example_1", "positive_example_2"]
+    neg_cols = ["negative_example_1", "negative_example_2"]
+
+    def _collect(series_list):
+        """Collapse a list of Series into unique values."""
+        combined = pd.concat(series_list, ignore_index=True)
+        return combined.unique().tolist()
+
+    result: Dict[str, Dict[str, List[str]]] = {}
+
+    for rule, group in df.groupby("rule", sort=False):
+        rule = str(rule).strip()
+        pos_examples = _collect([group[c] for c in pos_cols])
+        neg_examples = _collect([group[c] for c in neg_cols])
+        result[rule] = {"positives": pos_examples, "negatives": neg_examples}
+    return result
 
 
 # ---------------------------------------------------------------------------
