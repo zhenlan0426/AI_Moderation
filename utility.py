@@ -299,43 +299,6 @@ class TTTDataset(Dataset):
         return row["row_id"], input_ids.unsqueeze(0), torch.tensor(vi_index), labels
 
 
-# ---------------------------------------------------------------------------
-# Convenience DataLoader factory
-# ---------------------------------------------------------------------------
-
-def build_dataloader(
-    df: pd.DataFrame,
-    tokenizer,
-    batch_size: int = 1,
-    shuffle: bool = True,
-    num_workers: int = 0,
-    pin_memory: bool = True,
-    include_body: bool = False,
-) -> DataLoader:
-    """Return a ready-to-use PyTorch ``DataLoader`` for TTT training.
-    
-    Parameters
-    ----------
-    include_body : bool, optional
-        If True, include the 'body' column content in the positive/negative lists
-        based on the 'rule_violation' values. Defaults to False.
-    """
-    dataset = TTTDataset(
-        df=df,
-        grouped_examples=group_examples_by_rule(df, include_body=include_body),
-        tokenizer=tokenizer,
-    )
-
-    return DataLoader(
-        dataset,
-        batch_size=batch_size,
-        shuffle=shuffle,
-        num_workers=num_workers,
-        pin_memory=pin_memory,
-        collate_fn=lambda x:x[0] # only works for batch size one
-    )
-
-
 
 def load_grouped_data(
     data_dir: str = "Data/grouped"
@@ -368,15 +331,6 @@ def load_grouped_data(
     
     train_path = os.path.join(data_dir, "train_grouped.pkl")
     holdout_path = os.path.join(data_dir, "holdout_grouped.pkl")
-    metadata_path = os.path.join(data_dir, "metadata.pkl")
-    
-    # Check if files exist
-    if not os.path.exists(train_path):
-        raise FileNotFoundError(f"Train data not found at {train_path}. Run generate_grouped_data.py first.")
-    if not os.path.exists(holdout_path):
-        raise FileNotFoundError(f"Holdout data not found at {holdout_path}. Run generate_grouped_data.py first.")
-    
-    print(f"Loading grouped data from {data_dir}...")
     
     # Load train data
     with open(train_path, 'rb') as f:
@@ -385,18 +339,6 @@ def load_grouped_data(
     # Load holdout data
     with open(holdout_path, 'rb') as f:
         holdout_data = pickle.load(f)
-    
-    # Load and print metadata if available
-    if os.path.exists(metadata_path):
-        with open(metadata_path, 'rb') as f:
-            metadata = pickle.load(f)
-        print(f"Train rules: {len(metadata['train_rules'])}")
-        print(f"Holdout rules: {len(metadata['holdout_rules'])}")
-        print(f"Train negatives: {metadata['train_negatives_count']}")
-        print(f"Holdout negatives: {metadata['holdout_negatives_count']}")
-    else:
-        print(f"Train rules: {len(train_data)}")
-        print(f"Holdout rules: {len(holdout_data)}")
     
     return train_data, holdout_data
 
