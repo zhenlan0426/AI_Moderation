@@ -22,11 +22,13 @@ from __future__ import annotations
 import re
 from urllib.parse import urlparse
 import random
+import math
 from typing import Dict, List, Sequence
 
 import pandas as pd
 import torch
-from torch.utils.data import Dataset, DataLoader
+import numpy as np
+from torch.utils.data import Dataset, IterableDataset, DataLoader
 
 
 # ---------------------------------------------------------------------------
@@ -173,56 +175,51 @@ to train a classifier or compute loss directly.
 from typing import Dict, List
 import pandas as pd
 
-class TTTDataset(Dataset):
-    """PyTorch `Dataset` that yields tokenised TTT prompts.
+# ---------------------------------------------------------------------------
+# New iterable TTTDataset implementation for rule-level sampling
+# ---------------------------------------------------------------------------
+class TTTDataset(IterableDataset):
+    """PyTorch `IterableDataset` that yields tokenised TTT prompts.
+
+    Each sample is constructed on-the-fly from two dictionaries containing
+    positive and negative examples per rule – one for training, one for
+    hold-out evaluation.
+
+    The expected structure of each dictionary is::
+
+        {rule_text: {"positives": List[str], "negatives": List[str]}}
 
     Parameters
     ----------
-    df
-        *Cleaned* DataFrame containing at least the following columns::
-            ["subreddit", "rule", "body", "positive_example_1", "negative_example_1"]
-        Additional columns (e.g. `positive_example_2`) are ignored but allowed.
-
-    grouped_examples
-        Mapping produced by ``utility.group_examples_by_rule`` (or an equivalent
-        function).  The structure must be::
-
-            {rule_text: {"positives": List[str], "negatives": List[str]}}
-
-        The positive / negative pools are used to randomly sample *support*
-        examples for each datum.
-
+    data_pair
+        Tuple ``(train_dict, holdout_dict)`` with the structure described
+        above.
     tokenizer
-        Any HuggingFace *PreTrainedTokenizer* instance compatible with your
-        language model.
-
-    max_length
-        Sequence length after padding / truncation.  Defaults to 512.
-
-    Notes
-    -----
-    •  No heavy preprocessing is performed here – we assume `df` has already
-       been cleaned / normalised.
-    •  The dataset is *stateless* w.r.t. sampling order. Every `__getitem__`
-       call produces a fresh prompt, so subsequent epochs will see different
-       support examples / orders by design.
+        Any HuggingFace *PreTrainedTokenizer* compatible with your language
+        model.
+    samples_per_epoch
+        Number of prompts that an epoch of this dataset should yield.
     """
 
     violation_str: str = "Violation:"
 
     def __init__(
         self,
-        df: pd.DataFrame,
-        grouped_examples: Dict[str, Dict[str, List[str]]],
-        tokenizer
+        train_dict: Dict[str, Dict[str, List[str]]],
+        holdout_dict: Dict[str, Dict[str, List[str]]],
+        tokenizer,
+        samples_per_epoch: int = 1000,
     ) -> None:
         super().__init__()
-        self.df = df.reset_index(drop=True)
-        self.grouped_examples = grouped_examples
+        self.train_dict = train_dict
+        self.holdout_dict = holdout_dict
         self.tokenizer = tokenizer
+        self.samples_per_epoch = samples_per_epoch
 
+        # Rules present in *both* splits – we only sample from these.
+        self.rules: List[str] = list(train_dict.keys())
 
-        # Pre-encode "Violation:" once so we can search for it quickly later.
+        # Pre-encode "Violation:" for fast lookup later.
         self._violation_ids: torch.Tensor = tokenizer.encode(
             self.violation_str, add_special_tokens=False, return_tensors="pt"
         )[0]
@@ -230,73 +227,81 @@ class TTTDataset(Dataset):
     # ---------------------------------------------------------------------
     # Private helpers
     # ---------------------------------------------------------------------
-    def _sample_support(self, rule: str) -> tuple[str, str, str, str]:
-        """Return two support comments and their labels (text, label, ...)."""
-        pools = self.grouped_examples[rule]
-        pos_pool: Sequence[str] = pools["positives"]
-        neg_pool: Sequence[str] = pools["negatives"]
-        pos_example = random.choice(pos_pool)
-        neg_example = random.choice(neg_pool)
-        # Randomise order
+    def _sample_support(self, rule: str) -> tuple[tuple[str, int], tuple[str, int]]:
+        """Return two *support* examples (text, label) for *rule* from *train_dict*."""
+        pos = random.choice(self.train_dict[rule]["positives"])
+        neg = random.choice(self.train_dict[rule]["negatives"])
         if random.random() < 0.5:
-            return pos_example, "Yes", neg_example, "No"
-        return neg_example, "No", pos_example, "Yes"
+            return (pos, 1), (neg, 0)
+        return (neg, 0), (pos, 1)
 
-    def _build_prompt(self, row: pd.Series) -> str:
-        rule = row["rule"]
-        subreddit = row["subreddit"]
+    def _sample_target(self, rule: str) -> tuple[str, int]:
+        """Return one *target* example (text, label) for *rule* from *holdout_dict*."""
+        if random.random() < 0.5:
+            return random.choice(self.holdout_dict[rule]["positives"]), 1
+        return random.choice(self.holdout_dict[rule]["negatives"]), 0
 
-        # Support examples
-        comment1, label1, comment2, label2 = self._sample_support(rule)
-
+    def _build_prompt(
+        self,
+        rule: str,
+        comment1: str,
+        label1: int,
+        comment2: str,
+        label2: int,
+        target: str,
+    ) -> str:
+        lab_to_str = lambda l: "Yes" if l == 1 else "No"
         prompt = (
             "You are given a comment on reddit. Your task is to classify if it violates the given rule.\n"
-            f"Subreddit: r/{subreddit}\n"
             f"Rule: {rule}\n"
             f"Comment: {comment1}\n"
-            f"Violation: {label1}\n"
+            f"Violation: {lab_to_str(label1)}\n"
             f"Comment: {comment2}\n"
-            f"Violation: {label2}\n"
-            f"Comment: {row['body']}\n"
-            f"Violation:"
+            f"Violation: {lab_to_str(label2)}\n"
+            f"Comment: {target}\n"
+            "Violation:"
         )
-        labels = torch.tensor([1, 0], dtype=torch.long) if label1 == "Yes" else torch.tensor([0, 1], dtype=torch.long)
-        return prompt, labels
+        return prompt
 
     # ------------------------------------------------------------------
-    # PyTorch Dataset interface
+    # Dataset interface
     # ------------------------------------------------------------------
     def __len__(self) -> int:  # noqa: D401
-        return len(self.df)
+        return self.samples_per_epoch
 
-    def __getitem__(self, idx: int):  # noqa: D401
-        row = self.df.iloc[idx]
-        prompt, labels = self._build_prompt(row)
+    def __iter__(self):
+        """Yield a *finite* number of samples, each worker getting a distinct slice."""
+        worker_info = torch.utils.data.get_worker_info()
+        if worker_info is None:  # Single-process data loading
+            start = 0
+            end = self.samples_per_epoch
+            step = 1
+        else:  # In a worker process
+            per_worker = int(math.ceil(self.samples_per_epoch / worker_info.num_workers))
+            start = worker_info.id * per_worker
+            end = min(start + per_worker, self.samples_per_epoch)
+            step = 1  # contiguous block
 
-        input_ids = self.tokenizer.encode(
-            prompt,
-            add_special_tokens = True,
-            return_tensors="pt",
-        ).squeeze(0)
+        for _ in range(start, end, step):
+            rule = random.choice(self.rules)
+            # Support examples (train split)
+            (comment1, lab1), (comment2, lab2) = self._sample_support(rule)
+            # Target example (hold-out split)
+            target_comment, lab3 = self._sample_target(rule)
 
-        # ------------------------------------------------------------------
-        # Locate the final "Violation:" occurrence – that's where the model
-        # must output its prediction.
-        # ------------------------------------------------------------------
-        vi_index = []
-        seq_len = input_ids.size(0)
-        token_window = len(self._violation_ids)
+            prompt = self._build_prompt(rule, comment1, lab1, comment2, lab2, target_comment)
+            input_ids = self.tokenizer.encode(prompt, add_special_tokens=True, return_tensors="pt").squeeze(0)
 
-        # Sliding-window search for *all* occurrences
-        for i in range(seq_len - token_window + 1):
-            if torch.equal(
-                input_ids[i : i + token_window],  # noqa: E203 (black compat)
-                self._violation_ids,
-            ):
-                vi_index.append(i + token_window - 1) # we want the last index to predict yes / no.
+            # Locate each "Violation:" occurrence (we need the last token index)
+            vi_index = []
+            token_window = len(self._violation_ids)
+            seq_len = input_ids.size(0)
+            for i in range(seq_len - token_window + 1):
+                if torch.equal(input_ids[i : i + token_window], self._violation_ids):
+                    vi_index.append(i + token_window - 1)
 
-
-        return row["row_id"], input_ids.unsqueeze(0), torch.tensor(vi_index), labels
+            labels = torch.tensor([lab1, lab2, lab3], dtype=torch.long)
+            yield input_ids, torch.tensor(vi_index), labels
 
 
 
@@ -341,4 +346,28 @@ def load_grouped_data(
         holdout_data = pickle.load(f)
     
     return train_data, holdout_data
+
+# ---------------------------------------------------------------------------
+# DataLoader helper
+# ---------------------------------------------------------------------------
+
+def seed_worker(worker_id: int) -> None:
+    """Initialise each DataLoader worker with its own RNG seed.
+
+    This ensures workers draw *different* random samples while keeping the run
+    reproducible given a fixed global seed.  Use it by passing
+
+    ```python
+    loader = DataLoader(
+        dataset,
+        num_workers=4,
+        worker_init_fn=seed_worker,
+        # ... other kwargs
+    )
+    ```
+    """
+    worker_seed = torch.initial_seed() % 2**32
+    random.seed(worker_seed)
+    np.random.seed(worker_seed)
+    torch.manual_seed(worker_seed)
 
