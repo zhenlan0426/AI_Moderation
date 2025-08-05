@@ -21,3 +21,21 @@ Participants have access to a small subset of the data, which can be used as a d
 
 ### Key challenges
 The training dataset contains only two rules. The test dataset contains additional rules that models must be able to generalize to. (The number of unseen rules is not specified as part of the competition.)
+
+### Problem formulation
+a positive and a negative example are provided for each rule. During fine-tuning, model will be trained on label1 and label2. At inference time, prompt will be the same and prediction from last token will be the model output.
+
+
+```python
+prompt = (
+    "You are given a comment on reddit. Your task is to classify if it violates the given rule.\n"
+    f"Subreddit: r/{subreddit}\n"
+    f"Rule: {rule}\n"
+    f"Comment: {comment1}\n"
+    f"Violation: {label1}\n"
+    f"Comment: {comment2}\n"
+    f"Violation: {label2}\n"
+    f"Comment: {row['body']}\n"
+    f"Violation:"
+)
+```

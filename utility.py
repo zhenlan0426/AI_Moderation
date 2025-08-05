@@ -173,21 +173,25 @@ to train a classifier or compute loss directly.
 from typing import Dict, List
 import pandas as pd
 
-def group_examples_by_rule(df) -> Dict[str, Dict[str, List[str]]]:
+def group_examples_by_rule(df, include_body=False) -> Dict[str, Dict[str, List[str]]]:
     """Return deduplicated positive/negative lists per rule without any I/O or heavy normalisation.
 
     Parameters
     ----------
     df : pandas.DataFrame
         Pre-cleaned DataFrame containing the Data1 training rows.
-    (Assumed to already include the relevant columns and be cleaned.)
+        (Assumed to already include the relevant columns and be cleaned.)
+    include_body : bool, optional
+        If True, include the 'body' column content in the positive/negative lists
+        based on the 'rule_violation' values. Bodies with rule_violation=1 are
+        added to positives, bodies with rule_violation=0 are added to negatives.
+        Defaults to False.
 
     Returns
     -------
     dict
         Mapping ``{rule_text: {"positives": [...], "negatives": [...]}}``.
     """
-
 
     # Column names for positive and negative example sets
     pos_cols = ["positive_example_1", "positive_example_2"]
@@ -202,8 +206,25 @@ def group_examples_by_rule(df) -> Dict[str, Dict[str, List[str]]]:
 
     for rule, group in df.groupby("rule", sort=False):
         rule = str(rule).strip()
-        pos_examples = _collect([group[c] for c in pos_cols])
-        neg_examples = _collect([group[c] for c in neg_cols])
+        
+        # Build series lists for positive and negative examples
+        pos_series_list = [group[c] for c in pos_cols]
+        neg_series_list = [group[c] for c in neg_cols]
+        
+        # Optionally include body content based on rule_violation
+        if include_body:
+            # Bodies that violate the rule (rule_violation=1) go to positives
+            violating_bodies = group[group["rule_violation"] == 1]["body"]
+            pos_series_list.append(violating_bodies)
+            
+            # Bodies that don't violate the rule (rule_violation=0) go to negatives  
+            non_violating_bodies = group[group["rule_violation"] == 0]["body"]
+            neg_series_list.append(non_violating_bodies)
+        
+        # Collect and deduplicate once per group
+        pos_examples = _collect(pos_series_list)
+        neg_examples = _collect(neg_series_list)
+        
         result[rule] = {"positives": pos_examples, "negatives": neg_examples}
     return result
 
@@ -292,7 +313,7 @@ class TTTDataset(Dataset):
             f"Comment: {comment2}\n"
             f"Violation: {label2}\n"
             f"Comment: {row['body']}\n"
-            f"{self.violation_str}"
+            f"Violation:"
         )
         labels = torch.tensor([1, 0], dtype=torch.long) if label1 == "Yes" else torch.tensor([0, 1], dtype=torch.long)
         return prompt, labels
@@ -344,11 +365,19 @@ def build_dataloader(
     shuffle: bool = True,
     num_workers: int = 0,
     pin_memory: bool = True,
+    include_body: bool = False,
 ) -> DataLoader:
-    """Return a ready-to-use PyTorch ``DataLoader`` for TTT training."""
+    """Return a ready-to-use PyTorch ``DataLoader`` for TTT training.
+    
+    Parameters
+    ----------
+    include_body : bool, optional
+        If True, include the 'body' column content in the positive/negative lists
+        based on the 'rule_violation' values. Defaults to False.
+    """
     dataset = TTTDataset(
         df=df,
-        grouped_examples=group_examples_by_rule(df),
+        grouped_examples=group_examples_by_rule(df, include_body=include_body),
         tokenizer=tokenizer,
     )
 
