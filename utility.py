@@ -28,6 +28,11 @@ from typing import Dict, List, Sequence
 import pandas as pd
 import torch
 import numpy as np
+
+# ---------------------------------------------------------------------------
+# Rule variants (paraphrased)
+# ---------------------------------------------------------------------------
+from rules import RULE_VARIANTS
 from torch.utils.data import Dataset, IterableDataset, DataLoader
 
 
@@ -142,6 +147,81 @@ def normalize_text(text: str) -> str:
     text = normalize_money(text)
     return text
 
+# ---------------------------------------------------------------------------
+# Prompt construction helper shared by TTT datasets
+# ---------------------------------------------------------------------------
+
+def build_ttt_prompt(
+    rule: str,
+    comment1: str,
+    label1: int | str,
+    comment2: str,
+    label2: int | str,
+    comment_test: str,
+    subreddit: str | None = None,
+) -> str:
+    """Construct a TTT classification prompt.
+
+    This helper implements rule-variant sampling via ``RULE_VARIANTS`` and is
+    shared by both `TTTDataset_map` and `TTTDataset_iter` to avoid code
+    duplication.
+    """
+
+    def _lab_to_str(l: int | str) -> str:
+        # Accept either 0/1 or "Yes"/"No" representations
+        if isinstance(l, str):
+            return l
+        return "Yes" if l == 1 else "No"
+
+    rule_text = random.choice(RULE_VARIANTS[rule])
+
+    header = (
+        "You are given a comment on reddit. Your task is to classify if it violates the given rule.\n"
+    )
+    if subreddit is not None:
+        header += f"Subreddit: r/{subreddit}\n"
+
+    prompt = (
+        header
+        + f"Rule: {rule_text}\n"
+        + f"Comment: {comment1}\n"
+        + f"Violation: {_lab_to_str(label1)}\n"
+        + f"Comment: {comment2}\n"
+        + f"Violation: {_lab_to_str(label2)}\n"
+        + f"Comment: {comment_test}\n"
+        + "Violation:"
+    )
+    return prompt
+
+# ---------------------------------------------------------------------------
+# Shared helpers: support sampling and "Violation:" index finding
+# ---------------------------------------------------------------------------
+
+def sample_support_numeric(pools: Dict[str, Sequence[str]]) -> tuple[str, int, str, int]:
+    """Randomly select one positive and one negative example and randomise their order.
+
+    Returns
+    -------
+    tuple
+        (comment1, label1, comment2, label2) with numeric labels (1 = violation, 0 = non-violation).
+    """
+    pos_example = random.choice(pools["positives"])
+    neg_example = random.choice(pools["negatives"])
+    if random.random() < 0.5:
+        return pos_example, 1, neg_example, 0
+    return neg_example, 0, pos_example, 1
+
+
+def find_violation_indices(input_ids: torch.Tensor, violation_ids: torch.Tensor) -> list[int]:
+    """Return indices of the last token of each occurrence of *violation_ids* inside *input_ids*."""
+    indices: list[int] = []
+    token_window = len(violation_ids)
+    seq_len = input_ids.size(0)
+    for i in range(seq_len - token_window + 1):
+        if torch.equal(input_ids[i : i + token_window], violation_ids):
+            indices.append(i + token_window - 1)
+    return indices
+
 
 # ---------------------------------------------------------------------------
 # Data1: Rule-based example aggregation
@@ -175,10 +255,125 @@ to train a classifier or compute loss directly.
 from typing import Dict, List
 import pandas as pd
 
+class TTTDataset_map(Dataset):
+    """PyTorch `Dataset` that yields tokenised TTT prompts.
+
+    Parameters
+    ----------
+    df
+        *Cleaned* DataFrame containing at least the following columns::
+            ["subreddit", "rule", "body", "positive_example_1", "negative_example_1"]
+        Additional columns (e.g. `positive_example_2`) are ignored but allowed.
+
+    grouped_examples
+        Mapping produced by ``utility.group_examples_by_rule`` (or an equivalent
+        function).  The structure must be::
+
+            {rule_text: {"positives": List[str], "negatives": List[str]}}
+
+        The positive / negative pools are used to randomly sample *support*
+        examples for each datum.
+
+    tokenizer
+        Any HuggingFace *PreTrainedTokenizer* instance compatible with your
+        language model.
+
+    max_length
+        Sequence length after padding / truncation.  Defaults to 512.
+
+    Notes
+    -----
+    •  No heavy preprocessing is performed here – we assume `df` has already
+       been cleaned / normalised.
+    •  The dataset is *stateless* w.r.t. sampling order. Every `__getitem__`
+       call produces a fresh prompt, so subsequent epochs will see different
+       support examples / orders by design.
+    """
+
+    violation_str: str = "Violation:"
+
+    def __init__(
+        self,
+        df: pd.DataFrame,
+        grouped_examples: Dict[str, Dict[str, List[str]]],
+        tokenizer
+    ) -> None:
+        super().__init__()
+        self.df = df.reset_index(drop=True)
+        self.grouped_examples = grouped_examples
+        self.tokenizer = tokenizer
+
+
+        # Pre-encode "Violation:" once so we can search for it quickly later.
+        self._violation_ids: torch.Tensor = tokenizer.encode(
+            self.violation_str, add_special_tokens=False, return_tensors="pt"
+        )[0]
+
+    # ------------------------------------------------------------------
+    # PyTorch Dataset interface
+    # ------------------------------------------------------------------
+    def __len__(self) -> int:  # noqa: D401
+        return len(self.df)
+
+    def __getitem__(self, idx: int):  # noqa: D401
+        row = self.df.iloc[idx]
+        rule = row["rule"]
+        subreddit = row["subreddit"]
+        comment1, label1, comment2, label2 = sample_support_numeric(self.grouped_examples[rule])
+        prompt = build_ttt_prompt(rule,comment1,label1,comment2,label2,row["body"],subreddit)
+        labels = torch.tensor([label1, label2], dtype=torch.long)
+
+        input_ids = self.tokenizer.encode(
+            prompt,
+            add_special_tokens = True,
+            return_tensors="pt",
+        ).squeeze(0)
+
+        # ------------------------------------------------------------------
+        # Locate the final "Violation:" occurrence – that's where the model
+        # must output its prediction.
+        # ------------------------------------------------------------------
+        vi_index = find_violation_indices(input_ids, self._violation_ids)
+
+
+        return row["row_id"], input_ids.unsqueeze(0), torch.tensor(vi_index), labels
+
+def build_dataloader_map(
+    df: pd.DataFrame,
+    tokenizer,
+    batch_size: int = 1,
+    shuffle: bool = True,
+    num_workers: int = 4,
+    pin_memory: bool = True,
+    include_body: bool = False,
+) -> DataLoader:
+    """Return a ready-to-use PyTorch ``DataLoader`` for TTT training.
+    
+    Parameters
+    ----------
+    include_body : bool, optional
+        If True, include the 'body' column content in the positive/negative lists
+        based on the 'rule_violation' values. Defaults to False.
+    """
+    from generate_grouped_data import group_examples_by_rule
+    dataset = TTTDataset_map(
+        df=df,
+        grouped_examples=group_examples_by_rule(df, include_body=include_body),
+        tokenizer=tokenizer,
+    )
+
+    return DataLoader(
+        dataset,
+        batch_size=batch_size,
+        shuffle=shuffle,
+        num_workers=num_workers,
+        pin_memory=pin_memory,
+        collate_fn=lambda x:x[0] # only works for batch size one
+    )    
 # ---------------------------------------------------------------------------
 # New iterable TTTDataset implementation for rule-level sampling
 # ---------------------------------------------------------------------------
-class TTTDataset(IterableDataset):
+class TTTDataset_iter(IterableDataset):
     """PyTorch `IterableDataset` that yields tokenised TTT prompts.
 
     Each sample is constructed on-the-fly from two dictionaries containing
@@ -227,41 +422,12 @@ class TTTDataset(IterableDataset):
     # ---------------------------------------------------------------------
     # Private helpers
     # ---------------------------------------------------------------------
-    def _sample_support(self, rule: str) -> tuple[tuple[str, int], tuple[str, int]]:
-        """Return two *support* examples (text, label) for *rule* from *train_dict*."""
-        pos = random.choice(self.train_dict[rule]["positives"])
-        neg = random.choice(self.train_dict[rule]["negatives"])
-        if random.random() < 0.5:
-            return (pos, 1), (neg, 0)
-        return (neg, 0), (pos, 1)
 
     def _sample_target(self, rule: str) -> tuple[str, int]:
         """Return one *target* example (text, label) for *rule* from *holdout_dict*."""
         if random.random() < 0.5:
             return random.choice(self.holdout_dict[rule]["positives"]), 1
         return random.choice(self.holdout_dict[rule]["negatives"]), 0
-
-    def _build_prompt(
-        self,
-        rule: str,
-        comment1: str,
-        label1: int,
-        comment2: str,
-        label2: int,
-        target: str,
-    ) -> str:
-        lab_to_str = lambda l: "Yes" if l == 1 else "No"
-        prompt = (
-            "You are given a comment on reddit. Your task is to classify if it violates the given rule.\n"
-            f"Rule: {rule}\n"
-            f"Comment: {comment1}\n"
-            f"Violation: {lab_to_str(label1)}\n"
-            f"Comment: {comment2}\n"
-            f"Violation: {lab_to_str(label2)}\n"
-            f"Comment: {target}\n"
-            "Violation:"
-        )
-        return prompt
 
     # ------------------------------------------------------------------
     # Dataset interface
@@ -282,20 +448,15 @@ class TTTDataset(IterableDataset):
         for _ in range(num_samples):
             rule = random.choice(self.rules)
             # Support examples (train split)
-            (comment1, lab1), (comment2, lab2) = self._sample_support(rule)
+            comment1, lab1, comment2, lab2 = sample_support_numeric(self.train_dict[rule])
             # Target example (hold-out split)
             target_comment, lab3 = self._sample_target(rule)
 
-            prompt = self._build_prompt(rule, comment1, lab1, comment2, lab2, target_comment)
+            prompt = build_ttt_prompt(rule, comment1, lab1, comment2, lab2, target_comment)
             input_ids = self.tokenizer.encode(prompt, add_special_tokens=True, return_tensors="pt").squeeze(0)
 
             # Locate each "Violation:" occurrence (we need the last token index)
-            vi_index = []
-            token_window = len(self._violation_ids)
-            seq_len = input_ids.size(0)
-            for i in range(seq_len - token_window + 1):
-                if torch.equal(input_ids[i : i + token_window], self._violation_ids):
-                    vi_index.append(i + token_window - 1)
+            vi_index = find_violation_indices(input_ids, self._violation_ids)
 
             labels = torch.tensor([lab1, lab2, lab3], dtype=torch.long)
             yield input_ids, torch.tensor(vi_index), labels
