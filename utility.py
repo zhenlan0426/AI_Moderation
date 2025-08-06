@@ -368,7 +368,7 @@ def build_dataloader_map(
         shuffle=shuffle,
         num_workers=num_workers,
         pin_memory=pin_memory,
-        collate_fn=lambda x:x[0] # only works for batch size one
+        collate_fn=lambda x: x[0]  # Extract single batch element (batch_size must be 1)
     )    
 # ---------------------------------------------------------------------------
 # New iterable TTTDataset implementation for rule-level sampling
@@ -423,11 +423,16 @@ class TTTDataset_iter(IterableDataset):
     # Private helpers
     # ---------------------------------------------------------------------
 
-    def _sample_target(self, rule: str) -> tuple[str, int]:
-        """Return one *target* example (text, label) for *rule* from *holdout_dict*."""
+    def _sample_target(self, rule: str) -> tuple[int, str, int]:
+        """Return one *target* example (idx, text, label) for *rule* from *holdout_dict*."""
         if random.random() < 0.5:
-            return random.choice(self.holdout_dict[rule]["positives"]), 1
-        return random.choice(self.holdout_dict[rule]["negatives"]), 0
+            sample_list = self.holdout_dict[rule]["negatives"]
+            label = 0
+        else:
+            sample_list = self.holdout_dict[rule]["positives"]
+            label = 1
+        idx = random.randint(0, len(sample_list) - 1)
+        return idx, sample_list[idx], label
 
     # ------------------------------------------------------------------
     # Dataset interface
@@ -450,7 +455,7 @@ class TTTDataset_iter(IterableDataset):
             # Support examples (train split)
             comment1, lab1, comment2, lab2 = sample_support_numeric(self.train_dict[rule])
             # Target example (hold-out split)
-            target_comment, lab3 = self._sample_target(rule)
+            idx, target_comment, lab3 = self._sample_target(rule)
 
             prompt = build_ttt_prompt(rule, comment1, lab1, comment2, lab2, target_comment)
             input_ids = self.tokenizer.encode(prompt, add_special_tokens=True, return_tensors="pt").squeeze(0)
@@ -459,7 +464,9 @@ class TTTDataset_iter(IterableDataset):
             vi_index = find_violation_indices(input_ids, self._violation_ids)
 
             labels = torch.tensor([lab1, lab2, lab3], dtype=torch.long)
-            yield input_ids, torch.tensor(vi_index), labels
+            # (rule, label, idx) is used to track the test example in case of ensamble prediction
+            # input_ids.unsqueeze(0) is used to make it a 2D tensor, so that it can be used in the model. as collate_fn=lambda x: x[0] is used in the dataloader for batch size 1.
+            yield (rule, lab3, idx), input_ids.unsqueeze(0), torch.tensor(vi_index), labels
 
 
 
