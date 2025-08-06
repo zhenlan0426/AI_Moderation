@@ -2,14 +2,25 @@
 """
 Script to generate grouped training data from Data1 and Data2/Data3 datasets.
 
-This script:
-1. Loads Data1 and splits it into train/holdout
-2. Groups Data1 examples by rule using group_examples_by_rule
-3. Loads Data2/Data3 using load_data2_data3_for_ttt  
-4. Combines both datasets maintaining shared negative structure
-5. Saves the result to disk in a memory-efficient format
+This script uses a hybrid approach:
 
-Output format: {rule_text: {"positives": [...], "negatives": shared_list}}
+For Data1:
+1. Loads entire Data1 dataset  
+2. Groups Data1 examples by rule using group_examples_by_rule
+3. Splits each rule's examples into train/holdout to prevent overlap
+
+For Data2/Data3:
+1. Loads datasets and removes duplicates on comment_text
+2. Splits into train/holdout first (split-first approach)
+3. Groups by rules using threshold-based classification
+4. Maintains shared negative structure for efficiency
+
+5. Combines both datasets 
+6. Saves the result to disk in a memory-efficient format
+
+Output format: {rule_text: {"positives": [...], "negatives": [...]}}
+
+This hybrid approach prevents overlap while being efficient for different dataset structures.
 """
 
 import os
@@ -96,6 +107,64 @@ DATA2_COLUMNS = ['severe_toxicity', 'obscene', 'threat', 'insult', 'identity_hat
 DATA3_COLUMNS = ['severe_toxicity', 'obscene', 'threat', 'insult', 'identity_attack', 'sexual_explicit']
 
 
+def _create_rule_dict_from_full_data(
+    data2_pos_df: pd.DataFrame,
+    data2_neg_df: pd.DataFrame, 
+    data3_pos_df: pd.DataFrame,
+    data3_neg_df: pd.DataFrame,
+    threshold: float
+) -> Dict[str, Dict[str, List[str]]]:
+    """
+    Create rule dictionary using complete datasets (before splitting).
+    This allows for proper splitting by rule to avoid overlap.
+    
+    Parameters
+    ----------
+    data2_pos_df : pd.DataFrame
+        Data2 complete positive examples
+    data2_neg_df : pd.DataFrame
+        Data2 complete negative examples
+    data3_pos_df : pd.DataFrame  
+        Data3 complete positive examples
+    data3_neg_df : pd.DataFrame
+        Data3 complete negative examples
+    threshold : float
+        Threshold for positive classification
+        
+    Returns
+    -------
+    Dict[str, Dict[str, List[str]]]
+        Dictionary with format {rule_text: {"positives": [...], "negatives": [...]}}
+    """
+    result = {}
+    
+    # Create one combined negative list from both datasets that all rules will share
+    data2_negatives = data2_neg_df['comment_text'].tolist()
+    data3_negatives = data3_neg_df['comment_text'].tolist()
+    combined_negatives = data2_negatives + data3_negatives
+    
+    # Process each rule
+    for rule_key, rule_text in RULE_DEFINITIONS.items():
+        positives = []
+        
+        # Check Data2 for this rule - get positives above threshold
+        if rule_key in DATA2_COLUMNS:
+            mask = data2_pos_df[rule_key] >= threshold
+            positives.extend(data2_pos_df[mask]['comment_text'].tolist())
+        
+        # Check Data3 for this rule - get positives above threshold
+        if rule_key in DATA3_COLUMNS:
+            mask = data3_pos_df[rule_key] >= threshold
+            positives.extend(data3_pos_df[mask]['comment_text'].tolist())
+        
+        result[rule_text] = {
+            'positives': positives,
+            'negatives': combined_negatives
+        }
+    
+    return result
+
+
 def _create_rule_dict_from_split_data(
     data2_pos_df: pd.DataFrame,
     data2_neg_df: pd.DataFrame, 
@@ -106,6 +175,9 @@ def _create_rule_dict_from_split_data(
     """
     Create rule dictionary using pre-split positive/negative dataframes.
     Much simpler since data is already separated.
+    
+    DEPRECATED: This function can cause overlap between train/holdout sets.
+    Use _create_rule_dict_from_full_data + split_grouped_examples_by_rule instead.
     
     Parameters
     ----------
@@ -177,7 +249,7 @@ def process_data2_data3_splits(
 ) -> tuple[Dict[str, Dict[str, List[str]]], Dict[str, Dict[str, List[str]]]]:
     """
     Process Data2 and Data3 split datasets into rule-based format for TTT training.
-    Uses pre-split positive/negative files for efficiency.
+    Uses split-first approach with deduplication on comment_text to prevent overlap.
     
     Parameters
     ----------
@@ -213,8 +285,30 @@ def process_data2_data3_splits(
     data3_pos = pd.read_csv(data3_pos_path)
     data3_neg = pd.read_csv(data3_neg_path)
     
-    print(f"Data2 - Positives: {len(data2_pos)}, Negatives: {len(data2_neg)}")
-    print(f"Data3 - Positives: {len(data3_pos)}, Negatives: {len(data3_neg)}")
+    print(f"Data2 - Positives: {len(data2_pos)} (before dedup), Negatives: {len(data2_neg)} (before dedup)")
+    print(f"Data3 - Positives: {len(data3_pos)} (before dedup), Negatives: {len(data3_neg)} (before dedup)")
+    
+    # Remove duplicates within each dataset
+    print("Removing within-dataset duplicates on comment_text...")
+    data2_pos = data2_pos.drop_duplicates(subset=['comment_text']).reset_index(drop=True)
+    data2_neg = data2_neg.drop_duplicates(subset=['comment_text']).reset_index(drop=True)
+    data3_pos = data3_pos.drop_duplicates(subset=['comment_text']).reset_index(drop=True)
+    data3_neg = data3_neg.drop_duplicates(subset=['comment_text']).reset_index(drop=True)
+    
+    # Remove cross-dataset duplicates (Data3 takes precedence over Data2)
+    print("Removing cross-dataset duplicates (Data3 takes precedence)...")
+    data2_pos_comments = set(data2_pos['comment_text'])
+    data2_neg_comments = set(data2_neg['comment_text'])
+    
+    # Remove Data2 comments that appear in Data3
+    data3_pos_comments = set(data3_pos['comment_text'])
+    data3_neg_comments = set(data3_neg['comment_text'])
+    
+    data2_pos = data2_pos[~data2_pos['comment_text'].isin(data3_pos_comments | data3_neg_comments)].reset_index(drop=True)
+    data2_neg = data2_neg[~data2_neg['comment_text'].isin(data3_pos_comments | data3_neg_comments)].reset_index(drop=True)
+    
+    print(f"Data2 - Positives: {len(data2_pos)} (after dedup), Negatives: {len(data2_neg)} (after dedup)")
+    print(f"Data3 - Positives: {len(data3_pos)} (after dedup), Negatives: {len(data3_neg)} (after dedup)")
     
     # Split positive datasets into train/holdout
     data2_pos_shuffled = data2_pos.sample(frac=1, random_state=random_seed).reset_index(drop=True)
@@ -260,6 +354,84 @@ def process_data2_data3_splits(
     return train_dict, holdout_dict
 
 
+def process_data2_data3_group_first(
+    data2_pos_path: str,
+    data2_neg_path: str, 
+    data3_pos_path: str,
+    data3_neg_path: str,
+    threshold: float = 0.5,
+    train_split: float = 0.7,
+    random_seed: int = 42
+) -> tuple[Dict[str, Dict[str, List[str]]], Dict[str, Dict[str, List[str]]]]:
+    """
+    Process Data2 and Data3 using group-first approach to prevent overlap.
+    
+    This function:
+    1. Loads complete datasets
+    2. Groups examples by rule first
+    3. Splits each rule's examples into train/holdout
+    
+    This prevents overlap between train and holdout sets for the same rule.
+    
+    Parameters
+    ----------
+    data2_pos_path : str
+        Path to data2_positive.csv file
+    data2_neg_path : str  
+        Path to data2_negative.csv file
+    data3_pos_path : str
+        Path to data3_positive.csv file
+    data3_neg_path : str
+        Path to data3_negative.csv file
+    threshold : float, optional
+        Threshold above which a comment will be considered positive for a rule.
+        Defaults to 0.5.
+    train_split : float, optional
+        Fraction of data to use for training (remainder goes to holdout).
+        Defaults to 0.7.
+    random_seed : int, optional
+        Random seed for reproducible splits. Defaults to 42.
+        
+    Returns
+    -------
+    tuple[Dict[str, Dict[str, List[str]]], Dict[str, Dict[str, List[str]]]]
+        A tuple containing (train_dict, holdout_dict) where each dict has the format:
+        {rule_text: {"positives": [...], "negatives": [...]}}
+    """
+    
+    print("Loading complete datasets...")
+    
+    # Load complete datasets
+    data2_pos = pd.read_csv(data2_pos_path)
+    data2_neg = pd.read_csv(data2_neg_path)
+    data3_pos = pd.read_csv(data3_pos_path)
+    data3_neg = pd.read_csv(data3_neg_path)
+    
+    print(f"Data2 - Positives: {len(data2_pos)}, Negatives: {len(data2_neg)}")
+    print(f"Data3 - Positives: {len(data3_pos)}, Negatives: {len(data3_neg)}")
+    
+    # Group by rules first (using complete datasets)
+    print("Creating rule groups from complete datasets...")
+    complete_grouped = _create_rule_dict_from_full_data(
+        data2_pos, data2_neg, data3_pos, data3_neg, threshold
+    )
+    
+    print(f"Created {len(complete_grouped)} rules from complete datasets")
+    
+    # Split each rule's examples into train/holdout
+    print("Splitting grouped examples by rule...")
+    train_dict, holdout_dict = split_grouped_examples_by_rule(
+        complete_grouped,
+        train_split=train_split,
+        random_seed=random_seed
+    )
+    
+    # Print summary statistics
+    _print_summary_stats(train_dict, holdout_dict)
+    
+    return train_dict, holdout_dict
+
+
 def load_data2_data3_for_ttt(
     threshold: float = 0.5,
     train_split: float = 0.7, 
@@ -268,6 +440,7 @@ def load_data2_data3_for_ttt(
 ) -> tuple[Dict[str, Dict[str, List[str]]], Dict[str, Dict[str, List[str]]]]:
     """
     Convenience function to load Data2 and Data3 split datasets using default paths.
+    Uses split-first approach with deduplication on comment_text to prevent overlap.
     
     Parameters
     ----------
@@ -422,18 +595,48 @@ def print_grouped_data_stats(
     for rule, data in holdout_data.items():
         print(f"  {rule[:50]}...: {len(data['positives'])} positives, {len(data['negatives'])} negatives")
 
-def load_and_split_data1(
-    data1_path: str = "Data/Data1/train.csv",
-    train_split: float = 0.7,
-    random_seed: int = 42
-) -> tuple[pd.DataFrame, pd.DataFrame]:
+def load_data1(
+    data1_path: str = "Data/Data1/train.csv"
+) -> pd.DataFrame:
     """
-    Load Data1 and split into train/holdout sets.
+    Load Data1 dataset without splitting.
     
     Parameters
     ----------
     data1_path : str
         Path to Data1 train.csv file
+        
+    Returns
+    -------
+    pd.DataFrame
+        Complete Data1 dataset
+    """
+    print(f"Loading Data1 from {data1_path}...")
+    df = pd.read_csv(data1_path)
+    print(f"Data1 total entries: {len(df)}")
+    return df
+
+
+def split_grouped_examples_by_rule(
+    grouped_data: Dict[str, Dict[str, List[str]]],
+    train_split: float = 0.7,
+    random_seed: int = 42
+) -> tuple[Dict[str, Dict[str, List[str]]], Dict[str, Dict[str, List[str]]]]:
+    """
+    Split grouped examples by rule into train/holdout sets.
+    
+    This ensures no overlap between train and holdout - each rule's examples
+    are split individually, so the same rule cannot have overlapping examples
+    between train and holdout sets.
+    
+    Special handling for shared negatives: If all rules have identical negatives
+    lists (common in Data2/3), splits negatives once and reuses the split
+    across all rules to maintain consistency and avoid overlap.
+    
+    Parameters
+    ----------
+    grouped_data : dict
+        Grouped data in format {rule_text: {"positives": [...], "negatives": [...]}}
     train_split : float
         Fraction for training set
     random_seed : int
@@ -441,22 +644,71 @@ def load_and_split_data1(
         
     Returns
     -------
-    tuple[pd.DataFrame, pd.DataFrame]
-        (train_df, holdout_df)
+    tuple[Dict[str, Dict[str, List[str]]], Dict[str, Dict[str, List[str]]]]
+        (train_grouped, holdout_grouped)
     """
-    print(f"Loading Data1 from {data1_path}...")
-    df = pd.read_csv(data1_path)
-    print(f"Data1 total entries: {len(df)}")
+    import random
+    random.seed(random_seed)
     
-    # Shuffle and split
-    df_shuffled = df.sample(frac=1, random_state=random_seed).reset_index(drop=True)
-    split_idx = int(len(df_shuffled) * train_split)
+    # Check if all rules have identical negatives (shared negatives case)
+    # Filter out NaN values and ensure all items are strings
+    def clean_negatives(neg_list):
+        return set(str(item) for item in neg_list if pd.notna(item) and item != '')
     
-    train_df = df_shuffled[:split_idx]
-    holdout_df = df_shuffled[split_idx:]
+    negatives_lists = [clean_negatives(data['negatives']) for data in grouped_data.values()]
+    has_shared_negatives = len(set(frozenset(neg_set) for neg_set in negatives_lists)) == 1
     
-    print(f"Data1 split - Train: {len(train_df)}, Holdout: {len(holdout_df)}")
-    return train_df, holdout_df
+    shared_train_negatives = None
+    shared_holdout_negatives = None
+    
+    if has_shared_negatives and negatives_lists:
+        print("Detected shared negatives - splitting once for all rules")
+        # Split negatives once for all rules
+        negatives = list(negatives_lists[0])  # All are identical, so use the first
+        random.shuffle(negatives)
+        
+        neg_split_idx = int(len(negatives) * train_split)
+        shared_train_negatives = negatives[:neg_split_idx]
+        shared_holdout_negatives = negatives[neg_split_idx:]
+        
+        print(f"Shared negatives - Train: {len(shared_train_negatives)}, Holdout: {len(shared_holdout_negatives)}")
+    
+    train_grouped = {}
+    holdout_grouped = {}
+    
+    for rule_text, data in grouped_data.items():
+        positives = data['positives'].copy()
+        
+        # Shuffle and split positives (always done per rule)
+        random.shuffle(positives)
+        pos_split_idx = int(len(positives) * train_split)
+        train_positives = positives[:pos_split_idx]
+        holdout_positives = positives[pos_split_idx:]
+        
+        # Handle negatives based on whether they're shared
+        if has_shared_negatives:
+            # Use pre-split shared negatives
+            train_negatives = shared_train_negatives
+            holdout_negatives = shared_holdout_negatives
+        else:
+            # Split negatives individually for this rule
+            negatives = data['negatives'].copy()
+            random.shuffle(negatives)
+            neg_split_idx = int(len(negatives) * train_split)
+            train_negatives = negatives[:neg_split_idx]
+            holdout_negatives = negatives[neg_split_idx:]
+        
+        train_grouped[rule_text] = {
+            "positives": train_positives,
+            "negatives": train_negatives
+        }
+        
+        holdout_grouped[rule_text] = {
+            "positives": holdout_positives,
+            "negatives": holdout_negatives
+        }
+    
+    return train_grouped, holdout_grouped
 
 
 def combine_data1_and_data23(
@@ -563,41 +815,45 @@ def main():
     # Configuration
     data1_path = "Data/Data1/train.csv"
     train_split = 0.7
-    threshold = 0.5
+    threshold = 0.33
     random_seed = 42
     output_dir = "Data/grouped"
     
-    # Step 1: Load and split Data1
-    print("\n1. Loading and splitting Data1...")
-    data1_train, data1_holdout = load_and_split_data1(
-        data1_path=data1_path,
+    # Step 1: Load entire Data1 dataset
+    print("\n1. Loading Data1...")
+    data1_full = load_data1(data1_path=data1_path)
+    
+    # Step 2: Group Data1 examples by rule (entire dataset)
+    print("\n2. Grouping Data1 examples by rule...")
+    data1_full_grouped = group_examples_by_rule(data1_full, include_body=True)
+    print(f"Data1 total rules: {len(data1_full_grouped)}")
+    
+    # Step 3: Split each rule's examples into train/holdout
+    print("\n3. Splitting Data1 grouped examples into train/holdout...")
+    data1_train_grouped, data1_holdout_grouped = split_grouped_examples_by_rule(
+        data1_full_grouped,
         train_split=train_split,
         random_seed=random_seed
     )
     
-    # Step 2: Group Data1 examples by rule
-    print("\n2. Grouping Data1 examples by rule...")
-    data1_train_grouped = group_examples_by_rule(data1_train, include_body=True)
-    data1_holdout_grouped = group_examples_by_rule(data1_holdout, include_body=True)
-    
     print(f"Data1 train rules: {len(data1_train_grouped)}")
     print(f"Data1 holdout rules: {len(data1_holdout_grouped)}")
     
-    # Step 3: Load Data2/3 grouped data
-    print("\n3. Loading Data2/3 grouped data...")
+    # Step 4: Load Data2/3 grouped data
+    print("\n4. Loading Data2/3 grouped data...")
     data23_train_grouped, data23_holdout_grouped = load_data2_data3_for_ttt(
         threshold=threshold,
         train_split=train_split,
         random_seed=random_seed
     )
     
-    # Step 4: Combine datasets
-    print("\n4. Combining datasets...")
+    # Step 5: Combine datasets
+    print("\n5. Combining datasets...")
     combined_train = combine_data1_and_data23(data1_train_grouped, data23_train_grouped)
     combined_holdout = combine_data1_and_data23(data1_holdout_grouped, data23_holdout_grouped)
     
-    # Step 5: Save to disk
-    print("\n5. Saving to disk...")
+    # Step 6: Save to disk
+    print("\n6. Saving to disk...")
     save_grouped_data(combined_train, combined_holdout, output_dir)
     
     print("\n=== Generation Complete ===")
