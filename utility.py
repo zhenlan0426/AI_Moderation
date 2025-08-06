@@ -272,17 +272,14 @@ class TTTDataset(IterableDataset):
     def __iter__(self):
         """Yield a *finite* number of samples, each worker getting a distinct slice."""
         worker_info = torch.utils.data.get_worker_info()
+        # Determine the number of samples for this worker
         if worker_info is None:  # Single-process data loading
-            start = 0
-            end = self.samples_per_epoch
-            step = 1
+            num_samples = self.samples_per_epoch
         else:  # In a worker process
-            per_worker = int(math.ceil(self.samples_per_epoch / worker_info.num_workers))
-            start = worker_info.id * per_worker
-            end = min(start + per_worker, self.samples_per_epoch)
-            step = 1  # contiguous block
+            # Split workload. Each worker gets a fraction of the total samples.
+            num_samples = int(math.ceil(self.samples_per_epoch / worker_info.num_workers))
 
-        for _ in range(start, end, step):
+        for _ in range(num_samples):
             rule = random.choice(self.rules)
             # Support examples (train split)
             (comment1, lab1), (comment2, lab2) = self._sample_support(rule)
