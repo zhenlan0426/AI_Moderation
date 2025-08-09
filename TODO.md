@@ -6,5 +6,7 @@
 - due to target noise, introduce soft labels
 - maybe URL is enough, no need for domain as there are too many domains?
 - bias or not for lm_head?
+- Optional once-only pseudo-labeling: add high-confidence test cases (e.g., p>0.9) into the support pool with weight < 1.0 for one extra sweep. Stop after one iteration to avoid confirmation bias.
+- For each test prompt, take the logits at the final “Violation:” position, compute softmax p over {No, Yes}, and minimize prediction entropy H(p) = −∑ p log p.
 
 - ✅ data2 and data3 needs to be split into positive/negative examples
