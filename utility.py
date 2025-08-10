@@ -216,18 +216,6 @@ def sample_support_numeric(pools: Dict[str, Sequence[str]]) -> tuple[str, int, s
         return pos_example, 1, neg_example, 0
     return neg_example, 0, pos_example, 1
 
-
-def sample_single_support_numeric(pools: Dict[str, Sequence[str]]) -> tuple[str, int]:
-    """Randomly select one support example (text, label) from the pools.
-
-    With 50/50 probability choose either a positive (label=1) or a negative
-    (label=0) example.
-    """
-    if random.random() < 0.5:
-        return random.choice(pools["positives"]), 1
-    return random.choice(pools["negatives"]), 0
-
-
 def find_violation_indices(input_ids: torch.Tensor, violation_ids: torch.Tensor) -> list[int]:
     """Return indices of the last token of each occurrence of *violation_ids* inside *input_ids*."""
     indices: list[int] = []
@@ -332,8 +320,9 @@ from typing import Dict, List
 import pandas as pd
 
 class TTTDataset_map(Dataset):
-    """PyTorch `Dataset` that yields tokenised TTT prompts.
-
+    """
+    Important Note: only works for num_workers = 1, as _sample_from_state is stateful and each worker start
+    from the same cursor.
     Parameters
     ----------
     df
@@ -361,9 +350,11 @@ class TTTDataset_map(Dataset):
     -----
     •  No heavy preprocessing is performed here – we assume `df` has already
        been cleaned / normalised.
-    •  The dataset is *stateless* w.r.t. sampling order. Every `__getitem__`
-       call produces a fresh prompt, so subsequent epochs will see different
-       support examples / orders by design.
+    •  Each row is yielded twice per epoch: once with a positive support and
+       once with a negative support. Which one appears first is chosen per-row
+       at initialisation time.
+    •  Support examples are drawn using a simple per-rule cyclic sampler with
+       in-place shuffling on cycle, providing stable coverage across epochs.
     """
 
     violation_str: str = "Violation:"
@@ -385,17 +376,41 @@ class TTTDataset_map(Dataset):
             self.violation_str, add_special_tokens=False, return_tensors="pt"
         )[0]
 
+        # Initial sampler state for per-rule cyclic support sampling
+        self._sampler_state = _init_sampler_state(self.grouped_examples)
+        _shuffle_sampler_state_inplace(self.grouped_examples)
+
+        # Decide per-row which polarity (positive/negative) appears first
+        self._first_positive_flags: List[bool] = [random.random() < 0.5 for _ in range(len(self.df))]
+        self._expanded_len: int = 2 * len(self.df)
+
     # ------------------------------------------------------------------
     # PyTorch Dataset interface
     # ------------------------------------------------------------------
     def __len__(self) -> int:  # noqa: D401
-        return len(self.df)
+        return self._expanded_len
 
     def __getitem__(self, idx: int):  # noqa: D401
-        row = self.df.iloc[idx]
+        base_idx = idx // 2
+        variant_idx = idx % 2  # 0 -> first variant, 1 -> second variant
+        row = self.df.iloc[base_idx]
         rule = row["rule"]
         subreddit = row["subreddit"]
-        support_comment, support_label = sample_single_support_numeric(self.grouped_examples[rule])
+        # Choose polarity for this variant based on per-row first/second ordering
+        first_is_positive = self._first_positive_flags[base_idx]
+        if variant_idx == 0:
+            desired_label = "positives" if first_is_positive else "negatives"
+        else:
+            desired_label = "negatives" if first_is_positive else "positives"
+
+        # Deterministic cyclic sampling of the chosen support polarity for this rule
+        _, support_comment, support_label = _sample_from_state(
+            self.grouped_examples,
+            self._sampler_state,
+            rule,
+            desired_label,
+            reshuffle_on_cycle=True,
+        )
         prompt = build_ttt_prompt(rule, support_comment, support_label, row["body"], subreddit)
         labels = torch.tensor([support_label], dtype=torch.long)
 
