@@ -23,7 +23,7 @@ import re
 from urllib.parse import urlparse
 import random
 import math
-from typing import Dict, List, Sequence
+from typing import Dict, List, Sequence, Tuple
 
 import pandas as pd
 import torch
@@ -243,81 +243,62 @@ def find_violation_indices(input_ids: torch.Tensor, violation_ids: torch.Tensor)
 # Deterministic cyclic sampling helpers (simple dict state; in-place shuffles)
 # ---------------------------------------------------------------------------
 
-
 def _init_sampler_state(
     rule_to_pools: Dict[str, Dict[str, List[str]]],
-) -> Dict[str, Dict[str, Dict[str, int]]]:
-    """Create per-rule per-pool cursors (lists are left untouched)."""
-    state: Dict[str, Dict[str, Dict[str, int]]] = {}
+) -> Dict[str, Dict[str, List[int]]]:
+    """Create per-rule per-pool cursors (cursor, total length)."""
+    state: Dict[str, Dict[str, List[int]]] = {}
     for rule, pools in rule_to_pools.items():
         pos = pools.get("positives", [])
         neg = pools.get("negatives", [])
         state[rule] = {
-            "positives": 0,
-            "negatives": 0,
+            "positives": [0, len(pos)],
+            "negatives": [0, len(neg)],
         }
     return state
 
 
-def _shuffle_sampler_state_inplace(
-    rule_to_pools: Dict[str, Dict[str, List[str]]],
-    rule_state: Dict[str, Dict[str, Dict[str, int]]],
-) -> None:
+def _shuffle_sampler_state_inplace(rule_to_pools: Dict[str, Dict[str, List[str]]]) -> None:
     """Shuffle leaf lists in-place for all rules/pools; reset cursors to 0."""
-    for rule, pools_state in rule_state.items():
-        pools = rule_to_pools.get(rule, {})
+    for _, pools in rule_to_pools.items():
         for key in ("positives", "negatives"):
             items = pools.get(key)
-            if items is None or len(items) <= 1:
-                pools_state[key]["cursor"] = 0
-                continue
             random.shuffle(items)
-            pools_state[key]["cursor"] = 0
 
 
 def _next_from_pool(
     pool_items: List[str],
-    pool_state: Dict[str, int],
+    pool_state: List[int],
     *,
     reshuffle_on_cycle: bool,
 ) -> tuple[int, str]:
-    if not pool_items:
-        raise IndexError("Empty pool")
-    cursor: int = int(pool_state["cursor"])  # current index within list
+
+    cursor, total_length = pool_state  # current index within list
     idx = cursor
     text = pool_items[idx]
     cursor += 1
-    if cursor >= len(pool_items):
+    if cursor >= total_length:
         cursor = 0
-        if reshuffle_on_cycle and len(pool_items) > 1:
+        if reshuffle_on_cycle:
             random.shuffle(pool_items)
-    pool_state["cursor"] = cursor
+    pool_state[0] = cursor
     return idx, text
 
 
 def _sample_from_state(
     rule_to_pools: Dict[str, Dict[str, List[str]]],
-    rule_state: Dict[str, Dict[str, Dict[str, int]]],
+    rule_state: Dict[str, Dict[str, List[int]]],
     rule: str,
-    desired_label: int,
+    desired_label: str,
     *,
     reshuffle_on_cycle: bool,
 ) -> tuple[int, str, int]:
-    """Return (idx, text, actual_label) using preferred label with fallback."""
-    pools = rule_to_pools[rule]
-    state = rule_state[rule]
-    choices = (desired_label, 1 - desired_label)
-    for lab in choices:
-        key = "positives" if lab == 1 else "negatives"
-        items = pools.get(key, []) or []
-        if len(items) == 0:
-            continue
-        try:
-            idx, text = _next_from_pool(items, state[key], reshuffle_on_cycle=reshuffle_on_cycle)
-            return idx, text, lab
-        except IndexError:
-            continue
-    raise ValueError(f"No available examples for rule: {rule}")
+    """Return (idx, text, actual_label) for the next example in the pool."""
+    pool = rule_to_pools[rule][desired_label]
+    state = rule_state[rule][desired_label]
+    idx, text = _next_from_pool(pool, state, reshuffle_on_cycle=reshuffle_on_cycle)
+    return idx, text, 1 if desired_label == "positives" else 0
+
 
 
 # ---------------------------------------------------------------------------
@@ -517,23 +498,8 @@ class TTTDataset_iter(IterableDataset):
         self._train_state = _init_sampler_state(self.train_dict)
         self._holdout_state = _init_sampler_state(self.holdout_dict)
         # Shuffle training lists in-place once initially (holdout remains deterministic)
-        _shuffle_sampler_state_inplace(self.train_dict, self._train_state)
+        _shuffle_sampler_state_inplace(self.train_dict)
 
-    # ---------------------------------------------------------------------
-    # Private helpers
-    # ---------------------------------------------------------------------
-
-    def _sample_target(self, rule: str) -> tuple[int, str, int]:
-        """Return one target (idx, text, label) for a rule from holdout via cyclic sampling."""
-        desired_label = 1 if random.random() < 0.5 else 0
-        idx, text, actual_label = _sample_from_state(
-            self.holdout_dict,
-            self._holdout_state,
-            rule,
-            desired_label,
-            reshuffle_on_cycle=False,
-        )
-        return idx, text, actual_label
 
     # ------------------------------------------------------------------
     # Dataset interface
@@ -553,17 +519,22 @@ class TTTDataset_iter(IterableDataset):
 
         for _ in range(num_samples):
             rule = random.choice(self.rules)
-            # One support example (train split) via cyclic sampler
-            desired_support = 1 if random.random() < 0.5 else 0
+            # sample support example
             _, support_comment, lab_support = _sample_from_state(
                 self.train_dict,
                 self._train_state,
                 rule,
-                desired_support,
+                "positives" if random.random() < 0.5 else "negatives",
                 reshuffle_on_cycle=True,
             )
-            # Target example (hold-out split)
-            idx, target_comment, label_test = self._sample_target(rule)
+            # sample test example
+            idx, target_comment, label_test = _sample_from_state(
+                self.holdout_dict,
+                self._holdout_state,
+                rule,
+                "positives" if random.random() < 0.5 else "negatives",
+                reshuffle_on_cycle=False,
+            )
 
             prompt = build_ttt_prompt(rule, support_comment, lab_support, target_comment)
             input_ids = self.tokenizer.encode(prompt, add_special_tokens=True, return_tensors="pt").squeeze(0)
