@@ -43,7 +43,8 @@ def _sanitize_text_list(texts: List[Any]) -> List[str]:
 def encode_texts_batch(texts: List[Any], tokenizer) -> List[List[int]]:
     """Encode a list of strings into lists of token ids without special tokens.
 
-    Uses the tokenizer's batch_encode_plus directly (single call).
+    Returns list of list of ints (ragged). This keeps compatibility with
+    downstream functions that expect Python lists.
     """
     cleaned_texts = _sanitize_text_list(texts)
     if len(cleaned_texts) == 0:
@@ -132,6 +133,38 @@ def build_vocab_mapping(
     return old_to_new, new_vocab_size
 
 
+def remap_grouped_token_ids(
+    tokenized_grouped: Dict[str, Dict[str, List[List[int]]]],
+    old_to_new: torch.Tensor,
+) -> Dict[str, Dict[str, List[torch.Tensor]]]:
+    """Remap nested grouped token ids using an ``old_to_new`` id map.
+
+    Accepts leaves as ``List[List[int]]`` for compatibility with existing code,
+    converts leaves to 1D Long tensors internally for vectorised remapping, and
+    returns the same structure with leaves as tensors. Shared pool lists are
+    preserved by caching on the pool list object's id.
+    """
+
+    # Cache remapped leaves by original list object id to preserve sharing.
+    remapped_by_obj_id: Dict[int, List[torch.Tensor]] = {}
+
+    def remap_sequence(sequence_ids: List[int]) -> torch.Tensor:
+        seq = torch.as_tensor(sequence_ids, dtype=torch.long, device=old_to_new.device)
+        return old_to_new.index_select(0, seq)
+
+    remapped: Dict[str, Dict[str, List[torch.Tensor]]] = {}
+    for rule, pools in tokenized_grouped.items():
+        remapped_rule: Dict[str, List[torch.Tensor]] = {}
+        for polarity in ("positives", "negatives"):
+            sequences = pools.get(polarity, [])
+            obj_key = id(sequences)
+            if obj_key not in remapped_by_obj_id:
+                remapped_by_obj_id[obj_key] = [remap_sequence(seq) for seq in sequences]
+            remapped_rule[polarity] = remapped_by_obj_id[obj_key]
+        remapped[rule] = remapped_rule
+
+    return remapped
+
 def gather_reduced_embedding(
     model,
     new_to_old_ids: torch.Tensor,
@@ -154,6 +187,8 @@ def save_pickle(obj: Any, path: str) -> None:
 
 
 def main() -> None:
+    from torch.utils.data import DataLoader
+    from utility import TTTDataset_iter, seed_worker
     model_name_or_path = "unsloth/Qwen3-4B-Base-unsloth-bnb-4bit"
     data_dir = "Data/grouped"
     model_dir = "Model"
@@ -166,7 +201,16 @@ def main() -> None:
 
     # Load grouped datasets
     train_grouped, holdout_grouped = load_grouped_data()
-
+    # get unique token ids from the dataloader as there are some special tokens in the tokenizer or prompt
+    dataloader = DataLoader(
+            TTTDataset_iter(train_grouped, holdout_grouped, tokenizer, samples_per_epoch=2000),
+            batch_size=1,
+            worker_init_fn=seed_worker,
+            collate_fn=lambda x: x[0]
+        )
+    sample_input_ids = []
+    for _, input_ids, _, _ in dataloader:
+        sample_input_ids.append(input_ids)
     # Tokenize both splits
     train_tok, train_seqs = tokenize_grouped_data(train_grouped, tokenizer)
     hold_tok, hold_seqs = tokenize_grouped_data(holdout_grouped, tokenizer)
@@ -176,7 +220,8 @@ def main() -> None:
     save_pickle(hold_tok, os.path.join(data_dir, "holdout_grouped_token_ids.pkl"))
 
     # Compute unique token ids across both splits
-    all_unique_ids = compute_unique_token_ids(train_seqs + hold_seqs)
+    all_unique_ids = compute_unique_token_ids(train_seqs + hold_seqs + sample_input_ids)
+    print(all_unique_ids.shape)
 
     # Determine original vocab size from tokenizer
     orig_vocab_size = tokenizer.vocab_size
@@ -184,7 +229,12 @@ def main() -> None:
     old_to_new, new_unk_index = build_vocab_mapping(
         used_old_ids=all_unique_ids,
         original_vocab_size=orig_vocab_size,
-    )
+        )
+    remapped_train = remap_grouped_token_ids(train_tok, old_to_new)
+    remapped_hold = remap_grouped_token_ids(hold_tok, old_to_new)
+    # Save remapped datasets
+    save_pickle(remapped_train, os.path.join(data_dir, "train_grouped_token_ids_remapped.pkl"))
+    save_pickle(remapped_hold, os.path.join(data_dir, "holdout_grouped_token_ids_remapped.pkl"))
 
     # Save mappings
     torch.save(old_to_new, os.path.join(model_dir, "vocab_mapping.pt"))
