@@ -11,5 +11,6 @@
 - remove UNK instead of using averaged vector as fallback
 - at inference time, positive/negative examples can be much fewer than test examples, fine-tune can lead to overfitting. maybe scale the learning rate by the ratio of positive/negative examples to test examples?
 - focus on the most unconfident examples (middle 25% of the test set)
+- per rule TTT or one TTT
 
 - ✅ data2 and data3 needs to be split into positive/negative examples
