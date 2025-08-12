@@ -216,36 +216,39 @@ class TTTDatasetBase:
     # -----------------------
     # Prompt-token helpers
     # -----------------------
+    def _enc(self, text: str, *, add_special_tokens: bool = False) -> torch.Tensor:
+        ids = self.tokenizer.encode(text, add_special_tokens=add_special_tokens, return_tensors="pt")[0]
+        if self._old_to_new is not None:
+            ids = self._old_to_new.index_select(0, ids)
+        return ids
+        
     def pretokenize_ttt_fragments(
         self,
-        tokenizer,
-        *,
-        old_to_new: torch.Tensor | None = None,
+        rules_to_tokenize: List[str] | None = None,
     ) -> None:
-        mapping = old_to_new if old_to_new is not None else getattr(self, "_old_to_new", None)
-
-        def _enc(text: str, *, add_special_tokens: bool = False) -> torch.Tensor:
-            ids = tokenizer.encode(text, add_special_tokens=add_special_tokens, return_tensors="pt")[0]
-            if mapping is not None:
-                ids = mapping.index_select(0, ids)
-            return ids
 
         # Keep BOS/EOS out to maintain simple index math
-        self._header_ids = _enc(
+        self._header_ids = self._enc(
             "You are given a comment on reddit. Your task is to classify if it violates the given rule.\n",
         )
-        self._comment_prefix_ids = _enc("Comment: ")
-        self._newline_ids = _enc("\n")
-        self._violation_yes_line_ids = _enc("Violation: Yes\n")
-        self._violation_no_line_ids = _enc("Violation: No\n")
-        self._violation_prompt_ids = _enc("Violation:")
+        self._comment_prefix_ids = self._enc("Comment: ")
+        self._newline_ids = self._enc("\n")
+        self._violation_yes_line_ids = self._enc("Violation: Yes\n")
+        self._violation_no_line_ids = self._enc("Violation: No\n")
+        self._violation_prompt_ids = self._enc("Violation:")
 
-        rule_variants_ids: Dict[str, List[torch.Tensor]] = {}
-        for rule_text, variants in RULE_VARIANTS.items():
-            encoded_variants: List[torch.Tensor] = []
-            for v in variants:
-                encoded_variants.append(_enc(f"Rule: {v}\n"))
-            rule_variants_ids[rule_text] = encoded_variants
+        rule_variants_ids: Dict[str, List[torch.Tensor] | torch.Tensor] = {}
+        if rules_to_tokenize is None:
+            # default: use paraphrase variants from RULE_VARIANTS
+            for rule_text, variants in RULE_VARIANTS.items():
+                encoded_variants: List[torch.Tensor] = []
+                for v in variants:
+                    encoded_variants.append(self._enc(f"Rule: {v}\n"))
+                rule_variants_ids[rule_text] = encoded_variants
+        else:
+            # map-style: tokenize only the provided unique rules (single variant)
+            for rule_text in rules_to_tokenize:
+                rule_variants_ids[rule_text] = self._enc(f"Rule: {rule_text}\n")
         self._rule_variants_ids = rule_variants_ids
 
     def compute_two_violation_end_indices(
@@ -277,7 +280,6 @@ For every row in the provided DataFrame we create a prompt that follows the
 `ttt_design.md` template:
 
     You are given a comment on reddit. Your task is to classify if it violates the given rule.
-    Subreddit: r/<subreddit>
     Rule: <rule text>
     Comment: <support example>
     Violation: <Yes|No>
@@ -306,8 +308,9 @@ class TTTDataset_map(TTTDatasetBase, Dataset):
     ----------
     df
         *Cleaned* DataFrame containing at least the following columns::
-            ["subreddit", "rule", "body", "positive_example_1", "negative_example_1"]
-        Additional columns (e.g. `positive_example_2`) are ignored but allowed.
+            ["rule", "body", "positive_example_1", "negative_example_1"]
+        Additional columns (e.g. `positive_example_2`) are ignored but allowed. Any
+        `subreddit` column, if present, is ignored in prompt construction.
 
     grouped_examples
         Mapping produced by ``utility.group_examples_by_rule`` (or an equivalent
@@ -341,18 +344,21 @@ class TTTDataset_map(TTTDatasetBase, Dataset):
     def __init__(
         self,
         df: pd.DataFrame,
-        grouped_examples: Dict[str, Dict[str, List[str]]],
-        tokenizer
+        grouped_examples: Dict[str, Dict[str, List[torch.Tensor]]],
+        tokenizer,
+        old_to_new: torch.Tensor,
     ) -> None:
         super().__init__()
         self.df = df.reset_index(drop=True)
         self.grouped_examples = grouped_examples
         self.tokenizer = tokenizer
-
+        self._old_to_new = old_to_new
 
         # Pre-encode static prompt fragments for consistency with iter dataset
         # Note: map dataset still builds full prompt as text below; this keeps API aligned
-        self.pretokenize_ttt_fragments(self.tokenizer)
+        # Pre-tokenize static fragments and unique rules present in df (vectorized)
+        unique_rules: List[str] = self.df["rule"].astype(str).unique().tolist()
+        self.pretokenize_ttt_fragments(rules_to_tokenize=unique_rules)
 
         # Initial sampler state for per-rule cyclic support sampling
         self._sampler_state = TTTDatasetBase._init_sampler_state(self.grouped_examples)
@@ -373,7 +379,6 @@ class TTTDataset_map(TTTDatasetBase, Dataset):
         variant_idx = idx % 2  # 0 -> first variant, 1 -> second variant
         row = self.df.iloc[base_idx]
         rule = row["rule"]
-        subreddit = row["subreddit"]
         # Choose polarity for this variant based on per-row first/second ordering
         first_is_positive = self._first_positive_flags[base_idx]
         if variant_idx == 0:
@@ -382,26 +387,43 @@ class TTTDataset_map(TTTDatasetBase, Dataset):
             desired_label = "negatives" if first_is_positive else "positives"
 
         # Deterministic cyclic sampling of the chosen support polarity for this rule
-        _, support_comment, support_label = _sample_from_state(
+        _, support_ids, support_label = TTTDatasetBase._sample_from_state(
             self.grouped_examples,
             self._sampler_state,
             rule,
             desired_label,
             reshuffle_on_cycle=True,
         )
-        prompt = build_ttt_prompt(rule, support_comment, support_label, row["body"], subreddit)
+
+        # Tokenize dynamic target part using exposed encoder (no specials)
+        target_ids = self._enc(str(row["body"]))
+
+        # Randomly choose a pre-tokenised rule variant line for this rule
+        rule_variant_ids = random.choice(self._rule_variants_ids[rule])
+
+        # Assemble the full prompt from pre-tokenised pieces
+        pieces = [
+            self._header_ids,
+            rule_variant_ids,
+            self._comment_prefix_ids,
+            support_ids,
+            self._newline_ids,
+            self._violation_yes_line_ids if support_label == 1 else self._violation_no_line_ids,
+            self._comment_prefix_ids,
+            target_ids,
+            self._newline_ids,
+            self._violation_prompt_ids,
+        ]
+        input_ids = torch.cat(pieces, dim=0)
+
+        # Compute the end indices for both occurrences of "Violation:"
+        vi_index = self.compute_two_violation_end_indices(
+            rule_variant_ids=rule_variant_ids,
+            support_ids=support_ids,
+            total_length=input_ids.numel(),
+        )
+
         labels = torch.tensor([support_label], dtype=torch.long)
-
-        input_ids = self.tokenizer.encode(
-            prompt,
-            add_special_tokens = True,
-            return_tensors="pt",
-        ).squeeze(0)
-
-        # Compute the index of the final "Violation:" using concatenated pieces length
-        # Here, we don't have the piecemeal assembly; fallback to simple search
-        vi_prompt_ids = self._violation_prompt_ids
-        vi_index = find_violation_indices(input_ids, vi_prompt_ids)
 
 
         return row["row_id"], input_ids.unsqueeze(0), torch.tensor(vi_index), labels
@@ -485,7 +507,7 @@ class TTTDataset_iter(TTTDatasetBase, IterableDataset):
         self.rules: List[str] = list(train_dict.keys())
 
         # Pre-encode static fragments and rule variants once; optionally remap ids
-        self.pretokenize_ttt_fragments(tokenizer, old_to_new=old_to_new)
+        self.pretokenize_ttt_fragments()
         # For index search, keep bare "Violation:" ids
         self._violation_ids: torch.Tensor = self._violation_prompt_ids
         # Build simple per-rule per-pool orders and cursors.
@@ -503,19 +525,11 @@ class TTTDataset_iter(TTTDatasetBase, IterableDataset):
 
     def __iter__(self):
         """Yield a *finite* number of samples, each worker getting a distinct slice."""
-        worker_info = torch.utils.data.get_worker_info()
-        # Determine the number of samples for this worker
-        if worker_info is None:  # Single-process data loading
-            num_samples = self.samples_per_epoch
-        else:  # In a worker process
-            # Split workload. Each worker gets a fraction of the total samples.
-            num_samples = int(math.ceil(self.samples_per_epoch / worker_info.num_workers))
-
-        for _ in range(num_samples):
+        for _ in range(self.samples_per_epoch):
             rule = random.choice(self.rules)
 
             # sample support example
-            _, support_leaf, lab_support = TTTDatasetBase._sample_from_state(
+            _, comment_train, label_train = TTTDatasetBase._sample_from_state(
                 self.train_dict,
                 self._train_state,
                 rule,
@@ -523,42 +537,41 @@ class TTTDataset_iter(TTTDatasetBase, IterableDataset):
                 reshuffle_on_cycle=True,
             )
             # sample test example
-            idx, target_leaf, label_test = TTTDatasetBase._sample_from_state(
+            idx, comment_test, label_test = TTTDatasetBase._sample_from_state(
                 self.holdout_dict,
                 self._holdout_state,
                 rule,
                 "positives" if random.random() < 0.5 else "negatives",
                 reshuffle_on_cycle=False,
             )
-
-            # support_leaf and target_leaf are already tokenized and remapped
+            # comment_train and comment_test are already tokenized and remapped
 
             # Randomly choose a pre-tokenised rule variant line for this rule
             rule_variant_ids = random.choice(self._rule_variants_ids[rule])
 
             # Assemble the full prompt from pre-tokenised pieces
             pieces = [
-                self._header_ids,
-                rule_variant_ids,
-                self._comment_prefix_ids,
-                support_leaf,
-                self._newline_ids,
-                self._violation_yes_line_ids if lab_support == 1 else self._violation_no_line_ids,
-                self._comment_prefix_ids,
-                target_leaf,
-                self._newline_ids,
-                self._violation_prompt_ids,
+                self._header_ids, # you are given a comment on reddit. Your task is to classify if it violates the given rule.
+                rule_variant_ids, # Rule: <rule text>
+                self._comment_prefix_ids, # Comment: 
+                comment_train, # actual comment for training
+                self._newline_ids, # \n
+                self._violation_yes_line_ids if label_train == 1 else self._violation_no_line_ids, # Violation: Yes or No
+                self._comment_prefix_ids, # Comment: 
+                comment_test, # actual comment for testing
+                self._newline_ids, # \n 
+                self._violation_prompt_ids, # Violation:
             ]
             input_ids = torch.cat(pieces, dim=0)
 
             # Compute end indices for both occurrences of "Violation:"
             vi_index = self.compute_two_violation_end_indices(
                 rule_variant_ids=rule_variant_ids,
-                support_ids=support_leaf,
+                support_ids=comment_train,
                 total_length=input_ids.numel(),
             )
 
-            labels = torch.tensor([lab_support, label_test], dtype=torch.long)
+            labels = torch.tensor([label_train, label_test], dtype=torch.long)
             # (rule, label, idx) is used to track the test example in case of ensemble prediction
             yield (rule, label_test, idx), input_ids.unsqueeze(0), torch.tensor(vi_index), labels
 
