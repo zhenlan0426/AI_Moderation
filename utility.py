@@ -147,145 +147,124 @@ def normalize_text(text: str) -> str:
     text = normalize_money(text)
     return text
 
-# ---------------------------------------------------------------------------
-# Prompt construction helper shared by TTT datasets
-# ---------------------------------------------------------------------------
-
-def build_ttt_prompt(
-    rule: str,
-    support_comment: str,
-    support_label: int | str,
-    comment_test: str,
-    subreddit: str | None = None,
-) -> str:
-    """Construct a TTT classification prompt with a single support example.
-
-    The prompt format becomes:
-
-        You are given a comment on reddit. Your task is to classify if it violates the given rule.
-        [Subreddit: r/<subreddit>]
-        Rule: <rule variant>
-        Comment: <support_comment>
-        Violation: <Yes|No>
-        Comment: <target comment>
-        Violation:
-
-    This helper implements rule-variant sampling via ``RULE_VARIANTS`` and is
-    shared by both `TTTDataset_map` and `TTTDataset_iter`.
-    """
-
-    def _lab_to_str(l: int | str) -> str:
-        # Accept either 0/1 or "Yes"/"No" representations
-        if isinstance(l, str):
-            return l
-        return "Yes" if l == 1 else "No"
-
-    rule_text = random.choice(RULE_VARIANTS[rule])
-
-    header = (
-        "You are given a comment on reddit. Your task is to classify if it violates the given rule.\n"
-    )
-    if subreddit is not None:
-        header += f"Subreddit: r/{subreddit}\n"
-
-    prompt = (
-        header
-        + f"Rule: {rule_text}\n"
-        + f"Comment: {support_comment}\n"
-        + f"Violation: {_lab_to_str(support_label)}\n"
-        + f"Comment: {comment_test}\n"
-        + "Violation:"
-    )
-    return prompt
 
 # ---------------------------------------------------------------------------
-# Shared helpers: support sampling and "Violation:" index finding
+# Base class shared by TTT datasets
 # ---------------------------------------------------------------------------
 
-def sample_support_numeric(pools: Dict[str, Sequence[str]]) -> tuple[str, int, str, int]:
-    """Randomly select one positive and one negative example and randomise their order.
+class TTTDatasetBase:
+    """Shared utilities for TTT datasets (map and iter variants)."""
 
-    Returns
-    -------
-    tuple
-        (comment1, label1, comment2, label2) with numeric labels (1 = violation, 0 = non-violation).
-    """
-    pos_example = random.choice(pools["positives"])
-    neg_example = random.choice(pools["negatives"])
-    if random.random() < 0.5:
-        return pos_example, 1, neg_example, 0
-    return neg_example, 0, pos_example, 1
+    # -----------------------
+    # Sampler helpers
+    # -----------------------
+    @staticmethod
+    def _init_sampler_state(
+        rule_to_pools: Dict[str, Dict[str, List[object]]],
+    ) -> Dict[str, Dict[str, List[int]]]:
+        state: Dict[str, Dict[str, List[int]]] = {}
+        for rule, pools in rule_to_pools.items():
+            pos = pools.get("positives", [])
+            neg = pools.get("negatives", [])
+            state[rule] = {
+                "positives": [0, len(pos)],
+                "negatives": [0, len(neg)],
+            }
+        return state
 
-def find_violation_indices(input_ids: torch.Tensor, violation_ids: torch.Tensor) -> list[int]:
-    """Return indices of the last token of each occurrence of *violation_ids* inside *input_ids*."""
-    indices: list[int] = []
-    token_window = len(violation_ids)
-    seq_len = input_ids.size(0)
-    for i in range(seq_len - token_window + 1):
-        if torch.equal(input_ids[i : i + token_window], violation_ids):
-            indices.append(i + token_window - 1)
-    return indices
+    @staticmethod
+    def _shuffle_sampler_state_inplace(rule_to_pools: Dict[str, Dict[str, List[object]]]) -> None:
+        for _, pools in rule_to_pools.items():
+            for key in ("positives", "negatives"):
+                items = pools.get(key)
+                random.shuffle(items)
 
+    @staticmethod
+    def _next_from_pool(
+        pool_items: List[object],
+        pool_state: List[int],
+        *,
+        reshuffle_on_cycle: bool,
+    ) -> tuple[int, object]:
+        cursor, total_length = pool_state
+        idx = cursor
+        item = pool_items[idx]
+        cursor += 1
+        if cursor >= total_length:
+            cursor = 0
+            if reshuffle_on_cycle:
+                random.shuffle(pool_items)
+        pool_state[0] = cursor
+        return idx, item
 
-# ---------------------------------------------------------------------------
-# Deterministic cyclic sampling helpers (simple dict state; in-place shuffles)
-# ---------------------------------------------------------------------------
+    @staticmethod
+    def _sample_from_state(
+        rule_to_pools: Dict[str, Dict[str, List[object]]],
+        rule_state: Dict[str, Dict[str, List[int]]],
+        rule: str,
+        desired_label: str,
+        *,
+        reshuffle_on_cycle: bool,
+    ) -> tuple[int, object, int]:
+        pool = rule_to_pools[rule][desired_label]
+        state = rule_state[rule][desired_label]
+        idx, item = TTTDatasetBase._next_from_pool(
+            pool, state, reshuffle_on_cycle=reshuffle_on_cycle
+        )
+        return idx, item, 1 if desired_label == "positives" else 0
 
-def _init_sampler_state(
-    rule_to_pools: Dict[str, Dict[str, List[str]]],
-) -> Dict[str, Dict[str, List[int]]]:
-    """Create per-rule per-pool cursors (cursor, total length)."""
-    state: Dict[str, Dict[str, List[int]]] = {}
-    for rule, pools in rule_to_pools.items():
-        pos = pools.get("positives", [])
-        neg = pools.get("negatives", [])
-        state[rule] = {
-            "positives": [0, len(pos)],
-            "negatives": [0, len(neg)],
-        }
-    return state
+    # -----------------------
+    # Prompt-token helpers
+    # -----------------------
+    def pretokenize_ttt_fragments(
+        self,
+        tokenizer,
+        *,
+        old_to_new: torch.Tensor | None = None,
+    ) -> None:
+        mapping = old_to_new if old_to_new is not None else getattr(self, "_old_to_new", None)
 
+        def _enc(text: str, *, add_special_tokens: bool = False) -> torch.Tensor:
+            ids = tokenizer.encode(text, add_special_tokens=add_special_tokens, return_tensors="pt")[0]
+            if mapping is not None:
+                ids = mapping.index_select(0, ids)
+            return ids
 
-def _shuffle_sampler_state_inplace(rule_to_pools: Dict[str, Dict[str, List[str]]]) -> None:
-    """Shuffle leaf lists in-place for all rules/pools; reset cursors to 0."""
-    for _, pools in rule_to_pools.items():
-        for key in ("positives", "negatives"):
-            items = pools.get(key)
-            random.shuffle(items)
+        # Keep BOS/EOS out to maintain simple index math
+        self._header_ids = _enc(
+            "You are given a comment on reddit. Your task is to classify if it violates the given rule.\n",
+        )
+        self._comment_prefix_ids = _enc("Comment: ")
+        self._newline_ids = _enc("\n")
+        self._violation_yes_line_ids = _enc("Violation: Yes\n")
+        self._violation_no_line_ids = _enc("Violation: No\n")
+        self._violation_prompt_ids = _enc("Violation:")
 
+        rule_variants_ids: Dict[str, List[torch.Tensor]] = {}
+        for rule_text, variants in RULE_VARIANTS.items():
+            encoded_variants: List[torch.Tensor] = []
+            for v in variants:
+                encoded_variants.append(_enc(f"Rule: {v}\n"))
+            rule_variants_ids[rule_text] = encoded_variants
+        self._rule_variants_ids = rule_variants_ids
 
-def _next_from_pool(
-    pool_items: List[str],
-    pool_state: List[int],
-    *,
-    reshuffle_on_cycle: bool,
-) -> tuple[int, str]:
-
-    cursor, total_length = pool_state  # current index within list
-    idx = cursor
-    text = pool_items[idx]
-    cursor += 1
-    if cursor >= total_length:
-        cursor = 0
-        if reshuffle_on_cycle:
-            random.shuffle(pool_items)
-    pool_state[0] = cursor
-    return idx, text
-
-
-def _sample_from_state(
-    rule_to_pools: Dict[str, Dict[str, List[str]]],
-    rule_state: Dict[str, Dict[str, List[int]]],
-    rule: str,
-    desired_label: str,
-    *,
-    reshuffle_on_cycle: bool,
-) -> tuple[int, str, int]:
-    """Return (idx, text, actual_label) for the next example in the pool."""
-    pool = rule_to_pools[rule][desired_label]
-    state = rule_state[rule][desired_label]
-    idx, text = _next_from_pool(pool, state, reshuffle_on_cycle=reshuffle_on_cycle)
-    return idx, text, 1 if desired_label == "positives" else 0
+    def compute_two_violation_end_indices(
+        self,
+        *,
+        rule_variant_ids: torch.Tensor,
+        support_ids: torch.Tensor,
+        total_length: int,
+    ) -> list[int]:
+        prefix_len = (
+            self._header_ids.numel()
+            + rule_variant_ids.numel()
+            + self._comment_prefix_ids.numel()
+            + support_ids.numel()
+            + self._newline_ids.numel()
+        )
+        first_violation_end = prefix_len + self._violation_prompt_ids.numel() - 1
+        second_violation_end = total_length - 1
+        return [first_violation_end, second_violation_end]
 
 
 
@@ -319,7 +298,7 @@ to train a classifier or compute loss directly.
 from typing import Dict, List
 import pandas as pd
 
-class TTTDataset_map(Dataset):
+class TTTDataset_map(TTTDatasetBase, Dataset):
     """
     Important Note: only works for num_workers = 1, as _sample_from_state is stateful and each worker start
     from the same cursor.
@@ -371,17 +350,16 @@ class TTTDataset_map(Dataset):
         self.tokenizer = tokenizer
 
 
-        # Pre-encode "Violation:" once so we can search for it quickly later.
-        self._violation_ids: torch.Tensor = tokenizer.encode(
-            self.violation_str, add_special_tokens=False, return_tensors="pt"
-        )[0]
+        # Pre-encode static prompt fragments for consistency with iter dataset
+        # Note: map dataset still builds full prompt as text below; this keeps API aligned
+        self.pretokenize_ttt_fragments(self.tokenizer)
 
         # Initial sampler state for per-rule cyclic support sampling
-        self._sampler_state = _init_sampler_state(self.grouped_examples)
-        _shuffle_sampler_state_inplace(self.grouped_examples)
+        self._sampler_state = TTTDatasetBase._init_sampler_state(self.grouped_examples)
+        TTTDatasetBase._shuffle_sampler_state_inplace(self.grouped_examples)
 
         # Decide per-row which polarity (positive/negative) appears first
-        self._first_positive_flags: List[bool] = [random.random() < 0.5 for _ in range(len(self.df))]
+        self._first_positive_flags = np.random.rand(len(self.df)) < 0.5
         self._expanded_len: int = 2 * len(self.df)
 
     # ------------------------------------------------------------------
@@ -420,11 +398,10 @@ class TTTDataset_map(Dataset):
             return_tensors="pt",
         ).squeeze(0)
 
-        # ------------------------------------------------------------------
-        # Locate the final "Violation:" occurrence – that's where the model
-        # must output its prediction.
-        # ------------------------------------------------------------------
-        vi_index = find_violation_indices(input_ids, self._violation_ids)
+        # Compute the index of the final "Violation:" using concatenated pieces length
+        # Here, we don't have the piecemeal assembly; fallback to simple search
+        vi_prompt_ids = self._violation_prompt_ids
+        vi_index = find_violation_indices(input_ids, vi_prompt_ids)
 
 
         return row["row_id"], input_ids.unsqueeze(0), torch.tensor(vi_index), labels
@@ -464,7 +441,7 @@ def build_dataloader_map(
 # ---------------------------------------------------------------------------
 # New iterable TTTDataset implementation for rule-level sampling
 # ---------------------------------------------------------------------------
-class TTTDataset_iter(IterableDataset):
+class TTTDataset_iter(TTTDatasetBase, IterableDataset):
     """PyTorch `IterableDataset` that yields tokenised TTT prompts.
 
     Each sample is constructed on-the-fly from two dictionaries containing
@@ -491,9 +468,10 @@ class TTTDataset_iter(IterableDataset):
 
     def __init__(
         self,
-        train_dict: Dict[str, Dict[str, List[str]]],
-        holdout_dict: Dict[str, Dict[str, List[str]]],
+        train_dict: Dict[str, Dict[str, List[torch.Tensor]]],
+        holdout_dict: Dict[str, Dict[str, List[torch.Tensor]]],
         tokenizer,
+        old_to_new: torch.Tensor,
         samples_per_epoch: int = 1000,
     ) -> None:
         super().__init__()
@@ -501,19 +479,20 @@ class TTTDataset_iter(IterableDataset):
         self.holdout_dict = holdout_dict
         self.tokenizer = tokenizer
         self.samples_per_epoch = samples_per_epoch
+        self._old_to_new = old_to_new
 
         # Rules present in *both* splits – we only sample from these.
         self.rules: List[str] = list(train_dict.keys())
 
-        # Pre-encode "Violation:" for fast lookup later.
-        self._violation_ids: torch.Tensor = tokenizer.encode(
-            self.violation_str, add_special_tokens=False, return_tensors="pt"
-        )[0]
+        # Pre-encode static fragments and rule variants once; optionally remap ids
+        self.pretokenize_ttt_fragments(tokenizer, old_to_new=old_to_new)
+        # For index search, keep bare "Violation:" ids
+        self._violation_ids: torch.Tensor = self._violation_prompt_ids
         # Build simple per-rule per-pool orders and cursors.
-        self._train_state = _init_sampler_state(self.train_dict)
-        self._holdout_state = _init_sampler_state(self.holdout_dict)
+        self._train_state = TTTDatasetBase._init_sampler_state(self.train_dict)
+        self._holdout_state = TTTDatasetBase._init_sampler_state(self.holdout_dict)
         # Shuffle training lists in-place once initially (holdout remains deterministic)
-        _shuffle_sampler_state_inplace(self.train_dict)
+        TTTDatasetBase._shuffle_sampler_state_inplace(self.train_dict)
 
 
     # ------------------------------------------------------------------
@@ -534,8 +513,9 @@ class TTTDataset_iter(IterableDataset):
 
         for _ in range(num_samples):
             rule = random.choice(self.rules)
+
             # sample support example
-            _, support_comment, lab_support = _sample_from_state(
+            _, support_leaf, lab_support = TTTDatasetBase._sample_from_state(
                 self.train_dict,
                 self._train_state,
                 rule,
@@ -543,7 +523,7 @@ class TTTDataset_iter(IterableDataset):
                 reshuffle_on_cycle=True,
             )
             # sample test example
-            idx, target_comment, label_test = _sample_from_state(
+            idx, target_leaf, label_test = TTTDatasetBase._sample_from_state(
                 self.holdout_dict,
                 self._holdout_state,
                 rule,
@@ -551,15 +531,35 @@ class TTTDataset_iter(IterableDataset):
                 reshuffle_on_cycle=False,
             )
 
-            prompt = build_ttt_prompt(rule, support_comment, lab_support, target_comment)
-            input_ids = self.tokenizer.encode(prompt, add_special_tokens=True, return_tensors="pt").squeeze(0)
+            # support_leaf and target_leaf are already tokenized and remapped
 
-            # Locate each "Violation:" occurrence (we need the last token index)
-            vi_index = find_violation_indices(input_ids, self._violation_ids)
+            # Randomly choose a pre-tokenised rule variant line for this rule
+            rule_variant_ids = random.choice(self._rule_variants_ids[rule])
+
+            # Assemble the full prompt from pre-tokenised pieces
+            pieces = [
+                self._header_ids,
+                rule_variant_ids,
+                self._comment_prefix_ids,
+                support_leaf,
+                self._newline_ids,
+                self._violation_yes_line_ids if lab_support == 1 else self._violation_no_line_ids,
+                self._comment_prefix_ids,
+                target_leaf,
+                self._newline_ids,
+                self._violation_prompt_ids,
+            ]
+            input_ids = torch.cat(pieces, dim=0)
+
+            # Compute end indices for both occurrences of "Violation:"
+            vi_index = self.compute_two_violation_end_indices(
+                rule_variant_ids=rule_variant_ids,
+                support_ids=support_leaf,
+                total_length=input_ids.numel(),
+            )
 
             labels = torch.tensor([lab_support, label_test], dtype=torch.long)
-            # (rule, label, idx) is used to track the test example in case of ensamble prediction
-            # input_ids.unsqueeze(0) is used to make it a 2D tensor, so that it can be used in the model. as collate_fn=lambda x: x[0] is used in the dataloader for batch size 1.
+            # (rule, label, idx) is used to track the test example in case of ensemble prediction
             yield (rule, label_test, idx), input_ids.unsqueeze(0), torch.tensor(vi_index), labels
 
 
@@ -593,8 +593,8 @@ def load_grouped_data(
     import pickle
     import os
     
-    train_path = os.path.join(data_dir, "train_grouped.pkl")
-    holdout_path = os.path.join(data_dir, "holdout_grouped.pkl")
+    train_path = os.path.join(data_dir, "train_grouped_token_ids_remapped.pkl")
+    holdout_path = os.path.join(data_dir, "holdout_grouped_token_ids_remapped.pkl")
     
     # Load train data
     with open(train_path, 'rb') as f:
