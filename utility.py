@@ -387,7 +387,7 @@ class TTTDataset_map(TTTDatasetBase, Dataset):
             desired_label = "negatives" if first_is_positive else "positives"
 
         # Deterministic cyclic sampling of the chosen support polarity for this rule
-        _, support_ids, support_label = TTTDatasetBase._sample_from_state(
+        _, comment_train, label_train = TTTDatasetBase._sample_from_state(
             self.grouped_examples,
             self._sampler_state,
             rule,
@@ -396,21 +396,22 @@ class TTTDataset_map(TTTDatasetBase, Dataset):
         )
 
         # Tokenize dynamic target part using exposed encoder (no specials)
-        target_ids = self._enc(str(row["body"]))
+        comment_test = self._enc(row["body"])
 
-        # Randomly choose a pre-tokenised rule variant line for this rule
-        rule_variant_ids = random.choice(self._rule_variants_ids[rule])
+        # for inference, we dont have rule variants
+        # TODO: consider generate rule variants for inference
+        rule_variant_ids = self._rule_variants_ids[rule]
 
         # Assemble the full prompt from pre-tokenised pieces
         pieces = [
             self._header_ids,
             rule_variant_ids,
             self._comment_prefix_ids,
-            support_ids,
+            comment_train,
             self._newline_ids,
-            self._violation_yes_line_ids if support_label == 1 else self._violation_no_line_ids,
+            self._violation_yes_line_ids if label_train == 1 else self._violation_no_line_ids,
             self._comment_prefix_ids,
-            target_ids,
+            comment_test,
             self._newline_ids,
             self._violation_prompt_ids,
         ]
@@ -419,11 +420,11 @@ class TTTDataset_map(TTTDatasetBase, Dataset):
         # Compute the end indices for both occurrences of "Violation:"
         vi_index = self.compute_two_violation_end_indices(
             rule_variant_ids=rule_variant_ids,
-            support_ids=support_ids,
+            support_ids=comment_train,
             total_length=input_ids.numel(),
         )
 
-        labels = torch.tensor([support_label], dtype=torch.long)
+        labels = torch.tensor([label_train], dtype=torch.long)
 
 
         return row["row_id"], input_ids.unsqueeze(0), torch.tensor(vi_index), labels
@@ -431,7 +432,6 @@ class TTTDataset_map(TTTDatasetBase, Dataset):
 def build_dataloader_map(
     df: pd.DataFrame,
     tokenizer,
-    batch_size: int = 1,
     shuffle: bool = True,
     num_workers: int = 4,
     pin_memory: bool = True,
@@ -454,7 +454,7 @@ def build_dataloader_map(
 
     return DataLoader(
         dataset,
-        batch_size=batch_size,
+        batch_size=1,
         shuffle=shuffle,
         num_workers=num_workers,
         pin_memory=pin_memory,
@@ -618,28 +618,4 @@ def load_grouped_data(
         holdout_data = pickle.load(f)
     
     return train_data, holdout_data
-
-# ---------------------------------------------------------------------------
-# DataLoader helper
-# ---------------------------------------------------------------------------
-
-def seed_worker(worker_id: int) -> None:
-    """Initialise each DataLoader worker with its own RNG seed.
-
-    This ensures workers draw *different* random samples while keeping the run
-    reproducible given a fixed global seed.  Use it by passing
-
-    ```python
-    loader = DataLoader(
-        dataset,
-        num_workers=4,
-        worker_init_fn=seed_worker,
-        # ... other kwargs
-    )
-    ```
-    """
-    worker_seed = torch.initial_seed() % 2**32
-    random.seed(worker_seed)
-    np.random.seed(worker_seed)
-    torch.manual_seed(worker_seed)
 
