@@ -187,9 +187,11 @@ def save_pickle(obj: Any, path: str) -> None:
 
 
 def main() -> None:
+    # NOTE: there is a unidentifed remapping bug, resulting in worsening validation performance. and little improvement in VRAM. Disabled for now.
     from torch.utils.data import DataLoader
-    from utility import TTTDataset_iter, seed_worker
-    model_name_or_path = "unsloth/Qwen3-4B-Base-unsloth-bnb-4bit"
+    from utility import TTTDataset_iter
+    # model_name_or_path = "unsloth/Qwen3-4B-Base-unsloth-bnb-4bit"
+    model_name_or_path = "unsloth/Qwen3-1.7B-Base-unsloth-bnb-4bit"
     data_dir = "Data/grouped"
     model_dir = "Model"
     _ensure_dir(data_dir)
@@ -200,17 +202,19 @@ def main() -> None:
     )
 
     # Load grouped datasets
-    train_grouped, holdout_grouped = load_grouped_data()
-    # get unique token ids from the dataloader as there are some special tokens in the tokenizer or prompt
-    dataloader = DataLoader(
-            TTTDataset_iter(train_grouped, holdout_grouped, tokenizer, samples_per_epoch=2000),
-            batch_size=1,
-            worker_init_fn=seed_worker,
-            collate_fn=lambda x: x[0]
-        )
-    sample_input_ids = []
-    for _, input_ids, _, _ in dataloader:
-        sample_input_ids.append(input_ids)
+    # NOTE: this no longer works, load_grouped_data and TTTDataset_iter was based on the old text tokenizer (Commit de7656c) generating the
+    # remapped token ids. Now the code is changed to use token_ids directly.
+    train_grouped, holdout_grouped = load_grouped_data(load_in_token=False)
+    # # get unique token ids from the dataloader as there are some special tokens in the tokenizer or prompt
+    # dataloader = DataLoader(
+    #         TTTDataset_iter(train_grouped, holdout_grouped, tokenizer, samples_per_epoch=2000),
+    #         batch_size=1,
+    #         worker_init_fn=seed_worker,
+    #         collate_fn=lambda x: x[0]
+    #     )
+    # sample_input_ids = []
+    # for _, input_ids, _, _ in dataloader:
+    #     sample_input_ids.append(input_ids)
     # Tokenize both splits
     train_tok, train_seqs = tokenize_grouped_data(train_grouped, tokenizer)
     hold_tok, hold_seqs = tokenize_grouped_data(holdout_grouped, tokenizer)
@@ -219,36 +223,36 @@ def main() -> None:
     save_pickle(train_tok, os.path.join(data_dir, "train_grouped_token_ids.pkl"))
     save_pickle(hold_tok, os.path.join(data_dir, "holdout_grouped_token_ids.pkl"))
 
-    # Compute unique token ids across both splits
-    all_unique_ids = compute_unique_token_ids(train_seqs + hold_seqs + sample_input_ids)
-    print(all_unique_ids.shape)
+    # # Compute unique token ids across both splits
+    # all_unique_ids = compute_unique_token_ids(train_seqs + hold_seqs + sample_input_ids)
+    # print(all_unique_ids.shape)
 
-    # Determine original vocab size from tokenizer
-    orig_vocab_size = tokenizer.vocab_size
-    # Build mapping tensors including special/UNK tokens
-    old_to_new, new_unk_index = build_vocab_mapping(
-        used_old_ids=all_unique_ids,
-        original_vocab_size=orig_vocab_size,
-        )
-    remapped_train = remap_grouped_token_ids(train_tok, old_to_new)
-    remapped_hold = remap_grouped_token_ids(hold_tok, old_to_new)
-    # Save remapped datasets
-    save_pickle(remapped_train, os.path.join(data_dir, "train_grouped_token_ids_remapped.pkl"))
-    save_pickle(remapped_hold, os.path.join(data_dir, "holdout_grouped_token_ids_remapped.pkl"))
+    # # Determine original vocab size from tokenizer
+    # orig_vocab_size = tokenizer.vocab_size
+    # # Build mapping tensors including special/UNK tokens
+    # old_to_new, new_unk_index = build_vocab_mapping(
+    #     used_old_ids=all_unique_ids,
+    #     original_vocab_size=orig_vocab_size,
+    #     )
+    # remapped_train = remap_grouped_token_ids(train_tok, old_to_new)
+    # remapped_hold = remap_grouped_token_ids(hold_tok, old_to_new)
+    # # Save remapped datasets
+    # save_pickle(remapped_train, os.path.join(data_dir, "train_grouped_token_ids_remapped.pkl"))
+    # save_pickle(remapped_hold, os.path.join(data_dir, "holdout_grouped_token_ids_remapped.pkl"))
 
-    # Save mappings
-    torch.save(old_to_new, os.path.join(model_dir, "vocab_mapping.pt"))
-
-
-    emb_weight = model.get_input_embeddings().weight
-    orig_vocab_size = int(emb_weight.shape[0])
+    # # Save mappings
+    # torch.save(old_to_new, os.path.join(model_dir, "vocab_mapping.pt"))
 
 
-    reduced_emb = gather_reduced_embedding(model, all_unique_ids, torch_dtype=torch.float16)
-    # Append fallback embedding row as the mean of kept embeddings (or zeros if none)
-    fallback_row = reduced_emb.mean(dim=0, keepdim=True)
-    reduced_emb = torch.cat([reduced_emb, fallback_row], dim=0)
-    torch.save(reduced_emb, os.path.join(model_dir, "reduced_embedding.pt"))
+    # emb_weight = model.get_input_embeddings().weight
+    # orig_vocab_size = int(emb_weight.shape[0])
+
+
+    # reduced_emb = gather_reduced_embedding(model, all_unique_ids, torch_dtype=torch.float16)
+    # # Append fallback embedding row as the mean of kept embeddings (or zeros if none)
+    # fallback_row = reduced_emb.mean(dim=0, keepdim=True)
+    # reduced_emb = torch.cat([reduced_emb, fallback_row], dim=0)
+    # torch.save(reduced_emb, os.path.join(model_dir, "reduced_embedding.pt"))
 
 
 if __name__ == "__main__":

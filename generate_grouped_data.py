@@ -32,7 +32,7 @@ from typing import Dict, List
 # Data1: dataset processing
 # ---------------------------------------------------------------------------
 
-def group_examples_by_rule(df, include_body=False) -> Dict[str, Dict[str, List[str]]]:
+def group_examples_by_rule(df, include_body=False, tokenizer=None) -> Dict[str, Dict[str, List[str]]]:
     """Return deduplicated positive/negative lists per rule without any I/O or heavy normalisation.
 
     Parameters
@@ -61,6 +61,9 @@ def group_examples_by_rule(df, include_body=False) -> Dict[str, Dict[str, List[s
         combined = pd.concat(series_list, ignore_index=True)
         return combined.unique().tolist()
 
+    def _encode(text: List[str]) -> List[List[int]]:
+        return tokenizer.batch_encode_plus(text, add_special_tokens=True)["input_ids"]
+    
     result: Dict[str, Dict[str, List[str]]] = {}
 
     for rule, group in df.groupby("rule", sort=False):
@@ -83,7 +86,9 @@ def group_examples_by_rule(df, include_body=False) -> Dict[str, Dict[str, List[s
         # Collect and deduplicate once per group
         pos_examples = _collect(pos_series_list)
         neg_examples = _collect(neg_series_list)
-        
+        if tokenizer is not None:
+            pos_examples = _encode(pos_examples)
+            neg_examples = _encode(neg_examples)
         result[rule] = {"positives": pos_examples, "negatives": neg_examples}
     return result
 

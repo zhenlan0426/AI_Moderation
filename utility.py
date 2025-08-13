@@ -148,6 +148,25 @@ def normalize_text(text: str) -> str:
     return text
 
 
+def normalize_text_columns(
+    df: pd.DataFrame,
+) -> pd.DataFrame:
+    """Apply ``normalize_text`` to selected text columns of a DataFrame.
+    """
+
+    columns = (
+        "body",
+        "positive_example_1",
+        "positive_example_2",
+        "negative_example_1",
+        "negative_example_2",
+    )
+
+    for col in columns:
+        df[col] = df[col].map(normalize_text)
+    return df
+
+
 # ---------------------------------------------------------------------------
 # Base class shared by TTT datasets
 # ---------------------------------------------------------------------------
@@ -344,9 +363,9 @@ class TTTDataset_map(TTTDatasetBase, Dataset):
     def __init__(
         self,
         df: pd.DataFrame,
-        grouped_examples: Dict[str, Dict[str, List[torch.Tensor]]],
+        grouped_examples: Dict[str, Dict[str, List[List[int]]]],
         tokenizer,
-        old_to_new: torch.Tensor,
+        old_to_new: torch.Tensor | None = None,
     ) -> None:
         super().__init__()
         self.df = df.reset_index(drop=True)
@@ -394,7 +413,7 @@ class TTTDataset_map(TTTDatasetBase, Dataset):
             desired_label,
             reshuffle_on_cycle=True,
         )
-
+        comment_train = torch.tensor(comment_train)
         # Tokenize dynamic target part using exposed encoder (no specials)
         comment_test = self._enc(row["body"])
 
@@ -448,7 +467,7 @@ def build_dataloader_map(
     from generate_grouped_data import group_examples_by_rule
     dataset = TTTDataset_map(
         df=df,
-        grouped_examples=group_examples_by_rule(df, include_body=include_body),
+        grouped_examples=group_examples_by_rule(df, include_body=include_body, tokenizer=tokenizer),
         tokenizer=tokenizer,
     )
 
@@ -493,7 +512,7 @@ class TTTDataset_iter(TTTDatasetBase, IterableDataset):
         train_dict: Dict[str, Dict[str, List[torch.Tensor]]],
         holdout_dict: Dict[str, Dict[str, List[torch.Tensor]]],
         tokenizer,
-        old_to_new: torch.Tensor,
+        old_to_new: torch.Tensor | None = None,
         samples_per_epoch: int = 1000,
     ) -> None:
         super().__init__()
@@ -548,7 +567,9 @@ class TTTDataset_iter(TTTDatasetBase, IterableDataset):
 
             # Randomly choose a pre-tokenised rule variant line for this rule
             rule_variant_ids = random.choice(self._rule_variants_ids[rule])
-
+            comment_train = comment_train if isinstance(comment_train, torch.Tensor) else torch.tensor(comment_train)
+            comment_test = comment_test if isinstance(comment_test, torch.Tensor) else torch.tensor(comment_test)
+            
             # Assemble the full prompt from pre-tokenised pieces
             pieces = [
                 self._header_ids, # you are given a comment on reddit. Your task is to classify if it violates the given rule.
@@ -578,7 +599,8 @@ class TTTDataset_iter(TTTDatasetBase, IterableDataset):
 
 
 def load_grouped_data(
-    data_dir: str = "Data/grouped"
+    data_dir: str = "Data/grouped",
+    load_in_token: bool = True,
 ) -> tuple[Dict[str, Dict[str, List[str]]], Dict[str, Dict[str, List[str]]]]:
     """
     Load pre-generated grouped training data from disk.
@@ -606,8 +628,12 @@ def load_grouped_data(
     import pickle
     import os
     
-    train_path = os.path.join(data_dir, "train_grouped_token_ids_remapped.pkl")
-    holdout_path = os.path.join(data_dir, "holdout_grouped_token_ids_remapped.pkl")
+    if load_in_token:
+        train_path = os.path.join(data_dir, "train_grouped_token_ids.pkl")
+        holdout_path = os.path.join(data_dir, "holdout_grouped_token_ids.pkl")
+    else:
+        train_path = os.path.join(data_dir, "train_grouped.pkl")
+        holdout_path = os.path.join(data_dir, "holdout_grouped.pkl")
     
     # Load train data
     with open(train_path, 'rb') as f:
