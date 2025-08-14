@@ -13,4 +13,5 @@
 - focus on the most unconfident examples (middle 25% of the test set)
 - per rule TTT or one TTT
 - train on pos/neg and use KV cache to do inference to save VRAM
+- ARC without pretraining
 - ✅ data2 and data3 needs to be split into positive/negative examples
