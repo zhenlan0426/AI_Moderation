@@ -15,4 +15,5 @@
 - train on pos/neg and use KV cache to do inference to save VRAM
 - ARC without pretraining
 - without header
+- truncate comment (from start or random)
 - ✅ data2 and data3 needs to be split into positive/negative examples
