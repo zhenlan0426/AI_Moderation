@@ -12,5 +12,5 @@
 - at inference time, positive/negative examples can be much fewer than test examples, fine-tune can lead to overfitting. maybe scale the learning rate by the ratio of positive/negative examples to test examples?
 - focus on the most unconfident examples (middle 25% of the test set)
 - per rule TTT or one TTT
-
+- train on pos/neg and use KV cache to do inference to save VRAM
 - ✅ data2 and data3 needs to be split into positive/negative examples
