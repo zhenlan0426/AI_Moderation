@@ -7,7 +7,8 @@ import sys
 import math
 import time
 from typing import Dict, Tuple, List
-
+from unsloth import FastLanguageModel
+from peft import PeftModel
 import torch
 import pandas as pd
 
@@ -17,54 +18,14 @@ os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
 from utility import normalize_text_columns, build_dataloader_map
 
 
-def _get_forward_model(model):
-    """Return the callable inner model for forward().
-
-    Handles Unsloth FastModel and optional PEFT wrappers.
-    """
-    # Common nesting cases seen in notebook training
-    try:
-        if hasattr(model, "base_model") and hasattr(model.base_model, "model") and hasattr(model.base_model.model, "model"):
-            return model.base_model.model.model
-        if hasattr(model, "model"):
-            return model.model
-        return model
-    except Exception:
-        return model
-
-
-def _load_model_and_tokenizer(model_name: str, lora_dir: str | None, device: torch.device):
-    from unsloth import FastModel
-    model, tokenizer = FastModel.from_pretrained(
-        model_name=model_name,
-        load_in_4bit=True,
-    )
-
-    # Optionally load LoRA adapter if present
-    if lora_dir and os.path.isdir(lora_dir):
-        try:
-            from peft import PeftModel
-            model = PeftModel.from_pretrained(model, lora_dir, is_trainable=False)
-        except Exception as e:
-            print(f"[WARN] Failed to load LoRA from {lora_dir}: {e}")
-
-    # Move to device if needed (most 4-bit models sit on GPU already)
-    try:
-        model.to(device)
-    except Exception:
-        pass
-
-    return model, tokenizer
-
-
 @torch.no_grad()
 def _infer_on_split(
     split_df: pd.DataFrame,
     gpu_index: int,
-    model_name: str,
-    lora_dir: str | None,
-    lm_head_path: str,
     results_dict,
+    model_name: str = "/kaggle/input/basemodel/transformers/default/1/base_model",
+    lora_dir: str = "/kaggle/input/lora-jigsaw/merged_model4b/merged_model4b",
+    lm_head_path: str = "/kaggle/input/lora-jigsaw/lm_head_weight.pth",
 ):
     """Worker process: run inference on one GPU and return per-row aggregates.
 
@@ -74,18 +35,22 @@ def _infer_on_split(
     # Bind this process to a specific GPU
     os.environ["CUDA_VISIBLE_DEVICES"] = str(gpu_index)
     torch.cuda.set_device(0)  # becomes this process's GPU 0 after masking
-    device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
+    device = torch.device("cuda:0")
 
     # Load model/tokenizer on this GPU
-    model, tokenizer = _load_model_and_tokenizer(model_name, lora_dir, device)
-    forward_model = _get_forward_model(model)
-    forward_model.eval()
+    model, tokenizer = FastLanguageModel.from_pretrained(
+        model_name,
+        # dtype = torch.float16, # TODO: try this
+        load_in_4bit = True,
+        device_map={"": 0},
+    )
+    model = PeftModel.from_pretrained(model, lora_dir, is_trainable=False, device_map={"": 0})
+    FastLanguageModel.for_inference(model)
+    model.eval()
 
     # Load trained 2-class head (No, Yes) with shape (hidden, 2)
-    lm_head_weight = torch.load(lm_head_path, map_location="cpu")
-    if hasattr(lm_head_weight, "data"):
-        lm_head_weight = lm_head_weight.data
-    lm_head_weight = lm_head_weight.to(device)
+    lm_head_weight = torch.load(lm_head_path, map_location="cpu").to(dtype=torch.float16).to(device)
+
 
     # Build dataloader; note: map dataset duplicates each row (2 variants)
     dataloader = build_dataloader_map(
@@ -100,25 +65,15 @@ def _infer_on_split(
     row_id_to_sum: Dict[int, float] = {}
     row_id_to_count: Dict[int, int] = {}
 
-    # Mixed precision speeds up on modern GPUs
-    amp_dtype = torch.bfloat16 if torch.cuda.is_available() else None
-    amp_context = (
-        torch.amp.autocast(device_type="cuda", dtype=amp_dtype)
-        if amp_dtype is not None
-        else torch.cuda.amp.autocast(enabled=False)
-    )
 
-    with amp_context:
+    with torch.amp.autocast(device_type='cuda', dtype=torch.float16):
         for row_id, input_ids, vi_index, _ in dataloader:
             # Tensors are shaped: input_ids (1, L). vi_index is [first_vi_end, second_vi_end]
             input_ids = input_ids.to(device, non_blocking=True)
-            vi_index = vi_index.to(device)
-
-            output = forward_model(input_ids)
-            hidden_at_both = output.last_hidden_state[0, vi_index]  # (2, hidden)
-            logits = hidden_at_both @ lm_head_weight  # (2, 2) ordered as [No, Yes]
+            output = model.base_model.model.model(input_ids)
+            logits = output.last_hidden_state[0, -1] @ lm_head_weight
             # Use the last Violation: (target comment). Take probability of Yes (index 1)
-            probs = torch.softmax(logits[1], dim=-1)
+            probs = torch.softmax(logits, dim=-1)
             prob_yes = float(probs[1].detach().to("cpu"))
 
             row_id_int = int(row_id)

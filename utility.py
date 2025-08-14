@@ -32,7 +32,10 @@ import numpy as np
 # ---------------------------------------------------------------------------
 # Rule variants (paraphrased)
 # ---------------------------------------------------------------------------
-from rules import RULE_VARIANTS
+try:
+    from rules import RULE_VARIANTS
+except ImportError:
+    RULE_VARIANTS = None
 from torch.utils.data import Dataset, IterableDataset, DataLoader
 
 
@@ -316,9 +319,6 @@ The caller can then gather the model's hidden states / logits at this position
 to train a classifier or compute loss directly.
 """
 
-from typing import Dict, List
-import pandas as pd
-
 class TTTDataset_map(TTTDatasetBase, Dataset):
     """
     Important Note: only works for num_workers = 1, as _sample_from_state is stateful and each worker start
@@ -448,6 +448,66 @@ class TTTDataset_map(TTTDatasetBase, Dataset):
 
         return row["row_id"], input_ids.unsqueeze(0), torch.tensor(vi_index), labels
 
+def group_examples_by_rule(df, include_body=False, tokenizer=None) -> Dict[str, Dict[str, List[str]]]:
+    """Return deduplicated positive/negative lists per rule without any I/O or heavy normalisation.
+
+    Parameters
+    ----------
+    df : pandas.DataFrame
+        Pre-cleaned DataFrame containing the Data1 training rows.
+        (Assumed to already include the relevant columns and be cleaned.)
+    include_body : bool, optional
+        If True, include the 'body' column content in the positive/negative lists
+        based on the 'rule_violation' values. Bodies with rule_violation=1 are
+        added to positives, bodies with rule_violation=0 are added to negatives.
+        Defaults to False.
+
+    Returns
+    -------
+    dict
+        Mapping ``{rule_text: {"positives": [...], "negatives": [...]}}``.
+    """
+
+    # Column names for positive and negative example sets
+    pos_cols = ["positive_example_1", "positive_example_2"]
+    neg_cols = ["negative_example_1", "negative_example_2"]
+
+    def _collect(series_list):
+        """Collapse a list of Series into unique values."""
+        combined = pd.concat(series_list, ignore_index=True)
+        return combined.unique().tolist()
+
+    def _encode(text: List[str]) -> List[List[int]]:
+        return tokenizer.batch_encode_plus(text, add_special_tokens=True)["input_ids"]
+    
+    result: Dict[str, Dict[str, List[str]]] = {}
+
+    for rule, group in df.groupby("rule", sort=False):
+        rule = str(rule).strip()
+        
+        # Build series lists for positive and negative examples
+        pos_series_list = [group[c] for c in pos_cols]
+        neg_series_list = [group[c] for c in neg_cols]
+        
+        # Optionally include body content based on rule_violation
+        if include_body:
+            # Bodies that violate the rule (rule_violation=1) go to positives
+            violating_bodies = group[group["rule_violation"] == 1]["body"]
+            pos_series_list.append(violating_bodies)
+            
+            # Bodies that don't violate the rule (rule_violation=0) go to negatives  
+            non_violating_bodies = group[group["rule_violation"] == 0]["body"]
+            neg_series_list.append(non_violating_bodies)
+        
+        # Collect and deduplicate once per group
+        pos_examples = _collect(pos_series_list)
+        neg_examples = _collect(neg_series_list)
+        if tokenizer is not None:
+            pos_examples = _encode(pos_examples)
+            neg_examples = _encode(neg_examples)
+        result[rule] = {"positives": pos_examples, "negatives": neg_examples}
+    return result
+
 def build_dataloader_map(
     df: pd.DataFrame,
     tokenizer,
@@ -464,7 +524,6 @@ def build_dataloader_map(
         If True, include the 'body' column content in the positive/negative lists
         based on the 'rule_violation' values. Defaults to False.
     """
-    from generate_grouped_data import group_examples_by_rule
     dataset = TTTDataset_map(
         df=df,
         grouped_examples=group_examples_by_rule(df, include_body=include_body, tokenizer=tokenizer),
