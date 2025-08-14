@@ -14,4 +14,5 @@
 - per rule TTT or one TTT
 - train on pos/neg and use KV cache to do inference to save VRAM
 - ARC without pretraining
+- without header
 - ✅ data2 and data3 needs to be split into positive/negative examples
