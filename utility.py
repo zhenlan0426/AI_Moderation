@@ -366,12 +366,14 @@ class TTTDataset_map(TTTDatasetBase, Dataset):
         grouped_examples: Dict[str, Dict[str, List[List[int]]]],
         tokenizer,
         old_to_new: torch.Tensor | None = None,
+        Is_DEBUG: bool = False, # mute all randomization if True
     ) -> None:
         super().__init__()
         self.df = df.reset_index(drop=True)
         self.grouped_examples = grouped_examples
         self.tokenizer = tokenizer
         self._old_to_new = old_to_new
+        self.Is_DEBUG = Is_DEBUG
 
         # Pre-encode static prompt fragments for consistency with iter dataset
         # Note: map dataset still builds full prompt as text below; this keeps API aligned
@@ -381,10 +383,14 @@ class TTTDataset_map(TTTDatasetBase, Dataset):
 
         # Initial sampler state for per-rule cyclic support sampling
         self._sampler_state = TTTDatasetBase._init_sampler_state(self.grouped_examples)
-        TTTDatasetBase._shuffle_sampler_state_inplace(self.grouped_examples)
+        if not Is_DEBUG:
+            TTTDatasetBase._shuffle_sampler_state_inplace(self.grouped_examples)
 
         # Decide per-row which polarity (positive/negative) appears first
-        self._first_positive_flags = np.random.rand(len(self.df)) < 0.5
+        if Is_DEBUG:
+            self._first_positive_flags = np.ones(len(self.df))
+        else:
+            self._first_positive_flags = np.random.rand(len(self.df)) < 0.5
         self._expanded_len: int = 2 * len(self.df)
 
     # ------------------------------------------------------------------
@@ -411,7 +417,7 @@ class TTTDataset_map(TTTDatasetBase, Dataset):
             self._sampler_state,
             rule,
             desired_label,
-            reshuffle_on_cycle=True,
+            reshuffle_on_cycle=not self.Is_DEBUG,
         )
         comment_train = torch.tensor(comment_train)
         # Tokenize dynamic target part using exposed encoder (no specials)
@@ -516,6 +522,7 @@ def build_dataloader_map(
     pin_memory: bool = True,
     include_body: bool = False,
     grouped_examples: Dict[str, Dict[str, List[str]]] | None = None,
+    Is_DEBUG: bool = False,
 ) -> DataLoader:
     """Return a ready-to-use PyTorch ``DataLoader`` for TTT training.
     
@@ -529,6 +536,7 @@ def build_dataloader_map(
         df=df,
         grouped_examples=group_examples_by_rule(df, include_body=include_body, tokenizer=tokenizer) if grouped_examples is None else grouped_examples,
         tokenizer=tokenizer,
+        Is_DEBUG=Is_DEBUG,
     )
 
     return DataLoader(

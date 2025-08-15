@@ -10,7 +10,7 @@ os.environ["TOKENIZERS_PARALLELISM"] = "false"
 sys.path.append('/kaggle/usr/lib/utility')
 
 # Add configurable environment flag: set IS_LOCAL=1 to run local single-GPU inference.
-IS_LOCAL = True
+IS_LOCAL = os.environ.get('KAGGLE_KERNEL_RUN_TYPE') is None
 Is_DEBUG = True
 
 # AMP_DTYPE will be defined lazily *after* torch is imported inside each worker / main process.
@@ -39,6 +39,7 @@ def _infer_on_split(
     lora_dir: str,
     lm_head_path: str,
     grouped_examples: Dict[str, Dict[str, List[str]]] | None = None,
+    Is_DEBUG: bool = False,
 ):
     """Worker process: run inference on one GPU and return per-row aggregates.
     Args:
@@ -97,6 +98,7 @@ def _infer_on_split(
         pin_memory=True,
         include_body=False,
         grouped_examples=grouped_examples,
+        Is_DEBUG=Is_DEBUG,
     )
 
     row_id_to_list = defaultdict(list)
@@ -156,7 +158,7 @@ if __name__ == "__main__":
     test_df = normalize_text_columns(test_df)
     
     # Decide how many GPUs/workers to use
-    GPU_COUNT = 1 if IS_LOCAL else 2
+    GPU_COUNT = 1 if Is_DEBUG else (1 if IS_LOCAL else 2)
 
     if GPU_COUNT == 1:
         # -------------------------------------------------------------
@@ -168,6 +170,7 @@ if __name__ == "__main__":
             model_name,
             lora_dir,
             lm_head_path,
+            Is_DEBUG=Is_DEBUG,
         )
         if Is_DEBUG:
             # save the results
