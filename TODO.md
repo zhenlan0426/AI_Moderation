@@ -16,4 +16,6 @@
 - ARC without pretraining
 - without header
 - truncate comment (from start or random)
+- just <URL> without domain as there are too many domains?
+
 - ✅ data2 and data3 needs to be split into positive/negative examples

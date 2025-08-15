@@ -11,7 +11,7 @@ sys.path.append('/kaggle/usr/lib/utility')
 
 # Add configurable environment flag: set IS_LOCAL=1 to run local single-GPU inference.
 IS_LOCAL = os.environ.get('KAGGLE_KERNEL_RUN_TYPE') is None
-Is_DEBUG = True
+Is_DEBUG = False
 
 # AMP_DTYPE will be defined lazily *after* torch is imported inside each worker / main process.
 
@@ -58,7 +58,7 @@ def _infer_on_split(
 
     # Local (inside-worker) imports: no heavy CUDA initialisation happened yet.
     import torch
-    from unsloth import FastLanguageModel
+    from unsloth import FastModel
     from peft import PeftModel
 
     # Select the (sole) visible GPU as index 0 and prepare dtype
@@ -67,7 +67,7 @@ def _infer_on_split(
     AMP_DTYPE = torch.bfloat16 if IS_LOCAL else torch.float16
 
     # Load model/tokenizer on this GPU
-    model, tokenizer = FastLanguageModel.from_pretrained(
+    model, tokenizer = FastModel.from_pretrained(
         model_name,
         load_in_4bit = True,
         device_map={"": 0},            # 0 is correct after CUDA_VISIBLE_DEVICES masking
@@ -78,15 +78,11 @@ def _infer_on_split(
         is_trainable=False,
         device_map={"": 0},
     )
-    FastLanguageModel.for_inference(model)
+    FastModel.for_inference(model)
     model.eval()
 
     # Load trained 2-class head (No, Yes) – shape (hidden, 2)
-    lm_head_weight = (
-        torch.load(lm_head_path, map_location="cpu")
-        .to(dtype=AMP_DTYPE)
-        .to(device)
-    )
+    lm_head_weight = torch.nn.Parameter(torch.load(lm_head_path))
 
 
     # Build dataloader; note: map dataset duplicates each row (2 variants)
@@ -94,7 +90,6 @@ def _infer_on_split(
         df=split_df,
         tokenizer=tokenizer,
         shuffle=False,
-        num_workers=0,
         pin_memory=True,
         include_body=False,
         grouped_examples=grouped_examples,
@@ -108,7 +103,7 @@ def _infer_on_split(
             input_ids = input_ids.to(device)
             output = model.base_model.model.model(input_ids)
             # Use logits at the **second** "Violation:" token (target comment)
-            logits = output.last_hidden_state[0, vi_index[1]] @ lm_head_weight
+            logits = output.last_hidden_state[0, -1] @ lm_head_weight
             row_id_to_list[int(row_id)].append(logits.detach().cpu().tolist())
 
     return row_id_to_list
@@ -151,7 +146,7 @@ if __name__ == "__main__":
                 "negative_example_2": str,
                 }
     test_df = pd.read_csv(
-        ("Data/Data1/test.csv" if IS_LOCAL else "/kaggle/input/jigsaw-agile-community-rules/test.csv"),
+        ("Data/Data1/train.csv" if IS_LOCAL else "/kaggle/input/jigsaw-agile-community-rules/test.csv"),
         usecols=list(dtypes.keys()),
         dtype=dtypes,
     )
@@ -214,3 +209,8 @@ if __name__ == "__main__":
     # -------------------------------------------------------------
     sub = pd.DataFrame(results, columns=["row_id", "rule_violation"])
     sub.to_csv("submission.csv", index=False)
+
+    if IS_LOCAL:
+        from sklearn.metrics import roc_auc_score
+        train = pd.read_csv("Data/Data1/train.csv", usecols=["row_id","rule_violation"])
+        print(roc_auc_score(train["rule_violation"], sub["rule_violation"]))

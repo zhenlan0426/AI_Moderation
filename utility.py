@@ -517,8 +517,7 @@ def group_examples_by_rule(df, include_body=False, tokenizer=None) -> Dict[str, 
 def build_dataloader_map(
     df: pd.DataFrame,
     tokenizer,
-    shuffle: bool = True,
-    num_workers: int = 4,
+    shuffle: bool = False,
     pin_memory: bool = True,
     include_body: bool = False,
     grouped_examples: Dict[str, Dict[str, List[str]]] | None = None,
@@ -543,7 +542,7 @@ def build_dataloader_map(
         dataset,
         batch_size=1,
         shuffle=shuffle,
-        num_workers=num_workers,
+        num_workers=0, # NOTE: num_workers=0 is required due to the stateful sampler
         pin_memory=pin_memory,
         collate_fn=lambda x: x[0]  # Extract single batch element (batch_size must be 1)
     )    
