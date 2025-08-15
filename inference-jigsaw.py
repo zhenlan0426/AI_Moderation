@@ -137,9 +137,8 @@ def aggregate_predictions(row_id_to_list: Dict[int, List[float]],
 # ---------------------------------------------------------------------------
 
 if __name__ == "__main__":
-    import torch  # safe to import here – parent process can see all GPUs
+
     mp.set_start_method("spawn", force=True)
-    AMP_DTYPE = torch.bfloat16 if IS_LOCAL else torch.float16
     dtypes = {"row_id": int,
                 "body": str,
                 "rule": str,
@@ -157,7 +156,7 @@ if __name__ == "__main__":
     test_df = normalize_text_columns(test_df)
     
     # Decide how many GPUs/workers to use
-    GPU_COUNT = 1 if IS_LOCAL else torch.cuda.device_count()
+    GPU_COUNT = 1 if IS_LOCAL else 2
 
     if GPU_COUNT == 1:
         # -------------------------------------------------------------
@@ -185,8 +184,10 @@ if __name__ == "__main__":
         grouped_examples=group_examples_by_rule(test_df, include_body=False, tokenizer=tokenizer)
         # Randomly shuffle & split roughly equally across available GPUs
         test_df = test_df.sample(frac=1.0).reset_index(drop=True)
-        splits = torch.chunk(torch.tensor(test_df.index.values), GPU_COUNT)
-        df_splits = [test_df.iloc[split.tolist()].reset_index(drop=True) for split in splits]
+        mid = len(test_df) // 2
+        split_0 = test_df.iloc[:mid].reset_index(drop=True)
+        split_1 = test_df.iloc[mid:].reset_index(drop=True)
+        df_splits = [split_0, split_1]
 
         args_list = [
             (df_part, gpu_idx, model_name, lora_dir, lm_head_path, grouped_examples)
