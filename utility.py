@@ -478,7 +478,7 @@ def group_examples_by_rule(df, include_body=False, tokenizer=None) -> Dict[str, 
         return combined.unique().tolist()
 
     def _encode(text: List[str]) -> List[List[int]]:
-        return tokenizer.batch_encode_plus(text, add_special_tokens=True)["input_ids"]
+        return tokenizer.batch_encode_plus(text, add_special_tokens=False)["input_ids"]
     
     result: Dict[str, Dict[str, List[str]]] = {}
 
@@ -515,6 +515,7 @@ def build_dataloader_map(
     num_workers: int = 4,
     pin_memory: bool = True,
     include_body: bool = False,
+    grouped_examples: Dict[str, Dict[str, List[str]]] | None = None,
 ) -> DataLoader:
     """Return a ready-to-use PyTorch ``DataLoader`` for TTT training.
     
@@ -526,7 +527,7 @@ def build_dataloader_map(
     """
     dataset = TTTDataset_map(
         df=df,
-        grouped_examples=group_examples_by_rule(df, include_body=include_body, tokenizer=tokenizer),
+        grouped_examples=group_examples_by_rule(df, include_body=include_body, tokenizer=tokenizer) if grouped_examples is None else grouped_examples,
         tokenizer=tokenizer,
     )
 

@@ -2,3 +2,7 @@
 
 *.txt
 explore copy.ipynb
+*.pkl
+*.csv
+*.json
+*.jsonl

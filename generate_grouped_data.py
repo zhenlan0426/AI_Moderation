@@ -62,7 +62,7 @@ def group_examples_by_rule(df, include_body=False, tokenizer=None) -> Dict[str, 
         return combined.unique().tolist()
 
     def _encode(text: List[str]) -> List[List[int]]:
-        return tokenizer.batch_encode_plus(text, add_special_tokens=True)["input_ids"]
+        return tokenizer.batch_encode_plus(text, add_special_tokens=False)["input_ids"]
     
     result: Dict[str, Dict[str, List[str]]] = {}
 
