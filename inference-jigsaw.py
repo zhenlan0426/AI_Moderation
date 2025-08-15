@@ -83,7 +83,8 @@ def _infer_on_split(
 @torch.no_grad()
 def sum_softmax(logits):
     logits = torch.tensor(logits, dtype=torch.float32)
-    return float(torch.softmax(torch.mean(logits, dim=0), dim=0)[1].item())
+    mean = torch.mean(logits, dim=0)
+    return (mean[1] - mean[0]).item()
 
 def aggregate_predictions(row_id_to_list: Dict[int, List[float]],
                             fn) -> Dict[int, float]:
