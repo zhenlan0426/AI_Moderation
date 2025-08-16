@@ -22,6 +22,10 @@ if IS_LOCAL:
     model_name = "unsloth/Qwen3-4B-Base-unsloth-bnb-4bit"
     lora_dir   = "Model/merged_model4b"
     lm_head_path = 'Model/lm_head_weight.pth'
+    if Is_DEBUG:
+        data_path = "Data/Data1/train.csv"
+    else:
+        data_path = "Data/Data1/test.csv"
 else:
     # ---------------------------------------------------------------------
     # Kaggle competition paths – unchanged
@@ -29,6 +33,10 @@ else:
     model_name = "/kaggle/input/basemodel/transformers/default/1/base_model"
     lora_dir   = "/kaggle/input/lora-jigsaw/merged_model4b/merged_model4b"
     lm_head_path = "/kaggle/input/lora-jigsaw/lm_head_weight.pth"
+    if Is_DEBUG:
+        data_path = "/kaggle/input/jigsaw-agile-community-rules/train.csv"
+    else:
+        data_path = "/kaggle/input/jigsaw-agile-community-rules/test.csv"
 
 # Heavy libraries are imported *inside* this function after GPU masking so that
 # each spawned worker only sees its assigned GPU.
@@ -58,7 +66,7 @@ def _infer_on_split(
 
     # Local (inside-worker) imports: no heavy CUDA initialisation happened yet.
     import torch
-    from unsloth import FastModel
+    from unsloth import FastLanguageModel
     from peft import PeftModel
 
     # Select the (sole) visible GPU as index 0 and prepare dtype
@@ -67,7 +75,7 @@ def _infer_on_split(
     AMP_DTYPE = torch.bfloat16 if IS_LOCAL else torch.float16
 
     # Load model/tokenizer on this GPU
-    model, tokenizer = FastModel.from_pretrained(
+    model, tokenizer = FastLanguageModel.from_pretrained(
         model_name,
         load_in_4bit = True,
         device_map={"": 0},            # 0 is correct after CUDA_VISIBLE_DEVICES masking
@@ -78,7 +86,7 @@ def _infer_on_split(
         is_trainable=False,
         device_map={"": 0},
     )
-    FastModel.for_inference(model)
+    FastLanguageModel.for_inference(model)
     model.eval()
 
     # Load trained 2-class head (No, Yes) – shape (hidden, 2)
@@ -146,7 +154,7 @@ if __name__ == "__main__":
                 "negative_example_2": str,
                 }
     test_df = pd.read_csv(
-        ("Data/Data1/train.csv" if IS_LOCAL else "/kaggle/input/jigsaw-agile-community-rules/test.csv"),
+        data_path,
         usecols=list(dtypes.keys()),
         dtype=dtypes,
     )
@@ -167,10 +175,6 @@ if __name__ == "__main__":
             lm_head_path,
             Is_DEBUG=Is_DEBUG,
         )
-        if Is_DEBUG:
-            # save the results
-            with open("results_dict.pkl", "wb") as f:
-                pickle.dump(results_dict, f)
         results = aggregate_predictions(results_dict, sum_softmax)
     else:
         # -------------------------------------------------------------
@@ -198,10 +202,6 @@ if __name__ == "__main__":
         results_dict = worker_results[0]
         for d in worker_results[1:]:
             results_dict.update(d)
-        if Is_DEBUG:
-            # save the results
-            with open("results_dict.pkl", "wb") as f:
-                pickle.dump(results_dict, f)
         results = aggregate_predictions(results_dict, sum_softmax)
     
     # -------------------------------------------------------------
@@ -210,7 +210,7 @@ if __name__ == "__main__":
     sub = pd.DataFrame(results, columns=["row_id", "rule_violation"])
     sub.to_csv("submission.csv", index=False)
 
-    if IS_LOCAL:
+    if Is_DEBUG:
         from sklearn.metrics import roc_auc_score
-        train = pd.read_csv("Data/Data1/train.csv", usecols=["row_id","rule_violation"])
-        print(roc_auc_score(train["rule_violation"], sub["rule_violation"]))
+        test_df = test_df.merge(sub, on="row_id", how="left")
+        print(roc_auc_score(test_df["rule_violation_x"], test_df["rule_violation_y"]))

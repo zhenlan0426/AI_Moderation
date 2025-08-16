@@ -2,20 +2,30 @@
 Utility functions for text normalization used in the AI_Moderation project.
 
 Currently includes:
-1. normalize_urls        – Replace URLs with placeholder <URL_{domain}> (domain kept).
+1. normalize_urls        – Replace URLs with placeholder <URL>.
 2. normalize_usernames   – Replace Reddit and @-style user mentions with <USER>.
 3. normalize_emails      – Replace email addresses with <EMAIL>.
 4. normalize_subreddits  – Replace subreddit mentions (r/…) with <SUB>.
 5. normalize_phone_numbers – Replace phone numbers with <PHONE>.
 6. normalize_money       – Replace dollar amounts with <MONEY>.
-7. normalize_text        – Convenience wrapper that applies all of the above.
+7. normalize_random_strings – Replace random strings with <RANDOM>.
+8. normalize_ip_addresses – Remove IP addresses from text.
+9. normalize_timestamps  – Remove various timestamp formats from text.
+10. normalize_quotes     – Remove leading and trailing quotes but keep internal quotes.
+11. reduce_repeated_characters – Reduce repeated chars (letters to max 2, others to max 1).
+12. reduce_repeated_words – Reduce repeated words to at most 1 occurrence.
+13. reduce_repeated_whitespace – Reduce repeated spaces/tabs to single space.
+14. normalize_text       – Convenience wrapper that applies all of the above.
+15. apply_incremental_normalization – Apply only new normalization steps to pre-normalized text.
 
 Rationale
 ---------
 • Exact URLs, user names, emails, phone numbers, and specific dollar amounts rarely matter for rule-violation classification.
-• Keeping only the domain for URLs reduces vocabulary size while retaining potentially useful signal (e.g., youtube.com vs twitter.com).
-• Replacing personal identifiers removes nearly-unique tokens that otherwise bloat the tokenizer's sub-word vocabulary.
-• This normalization helps models generalize better by focusing on content patterns rather than specific identifiers.
+• Replacing personal identifiers and random strings removes nearly-unique tokens that otherwise bloat the tokenizer's sub-word vocabulary.
+• Removing IP addresses and timestamps eliminates metadata that is not relevant for content classification.
+• Removing leading/trailing quotes helps normalize text format without affecting content.
+• Reducing repeated characters, words, and whitespace helps normalize informal text patterns common in social media.
+• This normalization helps models generalize better by focusing on content patterns rather than specific identifiers or stylistic variations.
 """
 from __future__ import annotations
 
@@ -43,11 +53,34 @@ from torch.utils.data import Dataset, IterableDataset, DataLoader
 # Regex patterns (compiled once at import time)
 # ---------------------------------------------------------------------------
 
-# Generic URL recognizer – looks for http(s)://, ftp://, or bare www.<domain>
+# Generic URL recognizer – looks for http(s)://, ftp://, or bare www.<domain>, or spaced .com/.org/.net etc
 _URL_RE: re.Pattern[str] = re.compile(
-    r"(?:(?:https?://|ftp://|www\.)[^\s]+)",  # stop at whitespace
+    r"(?:(?:https?://|ftp://|www\.)[^\s]+)|(?:\w+\s*\.\s*(?:com|org|net|edu|gov|co\.uk|io|ly|me|tv|info|biz|us|ca)(?:\s|$|[^\w]))",  # includes spaced URLs
     flags=re.IGNORECASE,
 )
+
+# Random string pattern - matches truly random-looking codes/IDs with mixed digits, letters, and symbols
+_RANDOM_STRING_RE = re.compile(r"""
+    (?<!\w)                                    # Word boundary start
+    (?=\S*[0-9])                              # Must contain digit
+    (?=\S*[a-zA-Z])                           # Must contain letter  
+    (?=\S*[!@#$%^&*()_+\-=\[\]{}|;':\",.<>?~`])  # Must contain special char
+    (?:
+        [a-zA-Z0-9]*[0-9]+[a-zA-Z]+[!@#$%^&*()_+\-=\[\]{}|;':\",.<>?~`][a-zA-Z0-9!@#$%^&*()_+\-=\[\]{}|;':\",.<>?~`]* |
+        [a-zA-Z0-9]*[a-zA-Z]+[0-9]+[!@#$%^&*()_+\-=\[\]{}|;':\",.<>?~`][a-zA-Z0-9!@#$%^&*()_+\-=\[\]{}|;':\",.<>?~`]* |
+        [a-zA-Z0-9]*[!@#$%^&*()_+\-=\[\]{}|;':\",.<>?~`][a-zA-Z0-9]*[0-9][a-zA-Z0-9!@#$%^&*()_+\-=\[\]{}|;':\",.<>?~`]*
+    )
+    (?!\w)                                     # Word boundary end
+""", re.VERBOSE | re.IGNORECASE)
+# Repeated character patterns
+_REPEATED_LETTERS_RE: re.Pattern[str] = re.compile(r"([a-zA-Z])\1{2,}")
+_REPEATED_NONLETTERS_RE: re.Pattern[str] = re.compile(r"([^a-zA-Z\s])\1{1,}")
+
+# Repeated word pattern  
+_REPEATED_WORDS_RE: re.Pattern[str] = re.compile(r"\b(\w+)(\s+\1){1,}\b", flags=re.IGNORECASE)
+
+# Repeated whitespace pattern (spaces, tabs)
+_REPEATED_WHITESPACE_RE: re.Pattern[str] = re.compile(r"[ \t]+", flags=re.MULTILINE)
 
 # Reddit user mention formats: u/username or /u/username (case-insensitive)
 _REDDIT_USER_RE: re.Pattern[str] = re.compile(r"(?<!\w)/?u/[A-Za-z0-9_-]+", flags=re.IGNORECASE)
@@ -84,33 +117,47 @@ _MONEY_RE: re.Pattern[str] = re.compile(
     flags=re.IGNORECASE | re.VERBOSE,
 )
 
+# IP addresses (pattern: xxx.xxx.xxx.xxx)
+_IP_ADDRESS_RE: re.Pattern[str] = re.compile(r'\b(?:[0-9]{1,3}\.){3}[0-9]{1,3}\b')
+
+# Timestamps with time - Original format: HH:MM, Month DD, YYYY (UTC)
+_TIMESTAMP_TIME_ORIG_RE: re.Pattern[str] = re.compile(r'\b[0-9]{1,2}:[0-9]{1,2},\s+[A-Za-z]+\s+[0-9]{1,2},\s+[0-9]{4}\s+\(UTC\)')
+
+# Timestamps with time - NEW format: HH:MM, DD Mon YYYY (UTC)
+_TIMESTAMP_TIME_NEW_RE: re.Pattern[str] = re.compile(r'\b[0-9]{1,2}:[0-9]{1,2},\s+[0-9]{1,2}\s+[A-Za-z]+\s+[0-9]{4}\s+\(UTC\)')
+
+# Date-only timestamps - Original format: Month DD, YYYY (UTC)
+_DATE_ORIG_RE: re.Pattern[str] = re.compile(r'\b[A-Za-z]+\s+[0-9]{1,2},\s+[0-9]{4}\s+\(UTC\)')
+
+# Date-only timestamps - NEW format: DD Mon YYYY (UTC)
+_DATE_NEW_UTC_RE: re.Pattern[str] = re.compile(r'\b[0-9]{1,2}\s+[A-Za-z]+\s+[0-9]{4}\s+\(UTC\)')
+
+# Date-only timestamps - NEW format: DD Mon YYYY (without UTC)
+_DATE_NEW_NO_UTC_RE: re.Pattern[str] = re.compile(r'\b[0-9]{1,2}\s+[A-Za-z]+\s+[0-9]{4}(?!\s+\(UTC\)|\w)')
+
+# Timestamps without UTC (pattern: HH:MM, Month DD, YYYY)
+_TIMESTAMP_NO_UTC_ORIG_RE: re.Pattern[str] = re.compile(r'\b[0-9]{1,2}:[0-9]{1,2},\s+[A-Za-z]+\s+[0-9]{1,2},\s+[0-9]{4}(?!\s+\(UTC\))')
+
+# Timestamps without UTC (pattern: HH:MM, DD Mon YYYY)
+_TIMESTAMP_NO_UTC_NEW_RE: re.Pattern[str] = re.compile(r'\b[0-9]{1,2}:[0-9]{1,2},\s+[0-9]{1,2}\s+[A-Za-z]+\s+[0-9]{4}(?!\s+\(UTC\))')
+
+# ISO format timestamps (pattern: YYYY-MM-DD HH:MM:SS+TZ)
+_ISO_TIMESTAMP_RE: re.Pattern[str] = re.compile(r'\b[0-9]{4}-[0-9]{2}-[0-9]{2}\s+[0-9]{2}:[0-9]{2}:[0-9]{2}[.0-9]*[+-][0-9]{2}:[0-9]{2}\b')
+
 
 # ---------------------------------------------------------------------------
 # Public helpers
 # ---------------------------------------------------------------------------
 
 def normalize_urls(text: str) -> str:
-    """Replace every URL in *text* with ``<URL_{domain}>`` while retaining the domain.
+    """Replace every URL in *text* with ``<URL>``.
 
     Examples
     --------
     >>> normalize_urls("See https://sub.example.com/path?a=1 and http://example.org")
-    'See <URL_sub.example.com> and <URL_example.org>'
+    'See <URL> and <URL>'
     """
-
-    def _replace(match: re.Match[str]) -> str:
-        raw_url: str = match.group(0)
-
-        # Ensure the URL parses even when scheme is missing (e.g., "www.google.com")
-        to_parse = raw_url if re.match(r"https?://|ftp://", raw_url, flags=re.I) else f"http://{raw_url}"
-        try:
-            domain = urlparse(to_parse).netloc.split(":")[0].lower() or "unknown"
-        except Exception:
-            domain = "unknown"
-
-        return f"<URL_{domain}>"
-
-    return _URL_RE.sub(_replace, text)
+    return _URL_RE.sub("<URL>", text)
 
 
 def normalize_usernames(text: str) -> str:
@@ -140,6 +187,72 @@ def normalize_money(text: str) -> str:
     return _MONEY_RE.sub("<MONEY>", text)
 
 
+def normalize_random_strings(text: str) -> str:
+    """Replace random strings like '44XtPDKtcnDY30!' with ``<RANDOM>``."""
+    return _RANDOM_STRING_RE.sub("<RANDOM>", text)
+
+
+def normalize_ip_addresses(text: str) -> str:
+    """Remove IP addresses from text."""
+    return _IP_ADDRESS_RE.sub("", text)
+
+
+def normalize_timestamps(text: str) -> str:
+    """Remove various timestamp formats from text."""
+    # Remove timestamps with time - Original format: HH:MM, Month DD, YYYY (UTC)
+    text = _TIMESTAMP_TIME_ORIG_RE.sub("", text)
+    
+    # Remove timestamps with time - NEW format: HH:MM, DD Mon YYYY (UTC)
+    text = _TIMESTAMP_TIME_NEW_RE.sub("", text)
+    
+    # Remove date-only timestamps - Original format: Month DD, YYYY (UTC)
+    text = _DATE_ORIG_RE.sub("", text)
+    
+    # Remove date-only timestamps - NEW format: DD Mon YYYY (UTC)
+    text = _DATE_NEW_UTC_RE.sub("", text)
+    
+    # Remove date-only timestamps - NEW format: DD Mon YYYY (without UTC)
+    text = _DATE_NEW_NO_UTC_RE.sub("", text)
+    
+    # Remove timestamps without UTC (pattern: HH:MM, Month DD, YYYY)
+    text = _TIMESTAMP_NO_UTC_ORIG_RE.sub("", text)
+    
+    # Remove timestamps without UTC (pattern: HH:MM, DD Mon YYYY)
+    text = _TIMESTAMP_NO_UTC_NEW_RE.sub("", text)
+    
+    # Remove ISO format timestamps (pattern: YYYY-MM-DD HH:MM:SS+TZ)
+    text = _ISO_TIMESTAMP_RE.sub("", text)
+    
+    return text
+
+
+def normalize_quotes(text: str) -> str:
+    """Remove leading and trailing quotes but keep internal quotes."""
+    text = text.strip()
+    if text.startswith('"') and text.endswith('"'):
+        text = text[1:-1]
+    return text
+
+
+def reduce_repeated_characters(text: str) -> str:
+    """Reduce repeated characters: letters to max 2, non-letters to max 1."""
+    # Reduce repeated letters to max 2
+    text = _REPEATED_LETTERS_RE.sub(lambda m: m.group(1) + m.group(1), text)
+    # Reduce repeated non-letters to max 1  
+    text = _REPEATED_NONLETTERS_RE.sub(lambda m: m.group(1), text)
+    return text
+
+
+def reduce_repeated_words(text: str) -> str:
+    """Reduce repeated words to at most 1 occurrence (e.g., 'but but but' -> 'but')."""
+    return _REPEATED_WORDS_RE.sub(lambda m: m.group(1), text)
+
+
+def reduce_repeated_whitespace(text: str) -> str:
+    """Reduce repeated spaces and tabs to single space."""
+    return _REPEATED_WHITESPACE_RE.sub(" ", text)
+
+
 def normalize_text(text: str) -> str:
     """Apply all normalization functions in sequence."""
     text = normalize_urls(text)
@@ -148,8 +261,65 @@ def normalize_text(text: str) -> str:
     # text = normalize_subreddits(text)
     text = normalize_phone_numbers(text)
     text = normalize_money(text)
+    text = normalize_random_strings(text)
+    text = normalize_ip_addresses(text)
+    text = normalize_timestamps(text)
+    text = normalize_quotes(text)
+    text = reduce_repeated_characters(text)
+    text = reduce_repeated_words(text)
+    text = reduce_repeated_whitespace(text)
     return text
 
+
+def apply_incremental_normalization(text: str) -> str:
+    """Apply only the conservative normalization steps to already normalized text.
+    
+    Use this for text that already has the original normalize_text applied.
+    This applies:
+    1. Updated URL normalization (replace <URL_{domain}> with <URL>)
+    2. Conservative random string normalization
+    3. Character repetition reduction  
+    4. Word repetition reduction
+    5. Whitespace repetition reduction
+    
+    This function is designed to only make text shorter, never longer.
+    """
+    if not isinstance(text, str):
+        return text
+    
+    original_text = text
+    
+    # Step 1: Replace <URL_{domain}> with <URL>
+    text = re.sub(r"<URL_[^>]+>", "<URL>", text)
+    
+    # Step 2: Apply random string normalization using the improved pattern
+    # Temporarily protect existing tokens
+    token_pattern = r"<(USER|EMAIL|SUB|PHONE|MONEY|URL|RANDOM)>"
+    tokens = re.findall(token_pattern, text)
+    protected_text = re.sub(token_pattern, "TOKENPLACEHOLDER", text)
+    
+    # Apply random string normalization to protected text
+    protected_text = normalize_random_strings(protected_text)
+    
+    # Step 3: Reduce repeated characters
+    protected_text = re.sub(r"([a-zA-Z])\1{2,}", r"\1\1", protected_text)  # Letters to max 2
+    protected_text = re.sub(r"([^a-zA-Z\s])\1{1,}", r"\1", protected_text)  # Non-letters to max 1
+    
+    # Step 4: Reduce repeated words
+    protected_text = re.sub(r"\b(\w+)(\s+\1){1,}\b", r"\1", protected_text, flags=re.IGNORECASE)
+    
+    # Step 5: Reduce repeated whitespace
+    protected_text = re.sub(r"[ \t]+", " ", protected_text)
+    
+    # Restore tokens
+    for token in tokens:
+        protected_text = protected_text.replace("TOKENPLACEHOLDER", f"<{token}>", 1)
+    
+    # Safety check: if result is longer than original, return original
+    if len(protected_text) > len(original_text):
+        return original_text
+    
+    return protected_text
 
 def normalize_text_columns(
     df: pd.DataFrame,
@@ -196,6 +366,22 @@ class TTTDatasetBase:
 
     @staticmethod
     def _shuffle_sampler_state_inplace(rule_to_pools: Dict[str, Dict[str, List[object]]]) -> None:
+        # Check that each rule has its *own* negatives list – we forbid sharing
+        # the *same* list object across rules. If two rules point to the same
+        # negatives list (i.e. ``id(list)`` is identical), shuffling in place
+        # would silently reorder both at once, breaking deterministic sampling
+        # assumptions.  Detect and raise early instead of producing subtle bugs.
+
+        neg_list_owner = set
+        for rule, pools in rule_to_pools.items():
+            neg_items = pools["negatives"]
+            neg_id = id(neg_items)
+            if neg_id in neg_list_owner:
+                raise ValueError(
+                    f"Negatives list is shared between rules. Each rule must have its own independent negatives list."
+                )
+            neg_list_owner.add(neg_id)
+
         for _, pools in rule_to_pools.items():
             for key in ("positives", "negatives"):
                 items = pools.get(key)
@@ -601,7 +787,7 @@ class TTTDataset_iter(TTTDatasetBase, IterableDataset):
         self._holdout_state = TTTDatasetBase._init_sampler_state(self.holdout_dict)
         # Shuffle training lists in-place once initially (holdout remains deterministic)
         TTTDatasetBase._shuffle_sampler_state_inplace(self.train_dict)
-
+        TTTDatasetBase._shuffle_sampler_state_inplace(self.holdout_dict)
 
     # ------------------------------------------------------------------
     # Dataset interface
@@ -699,8 +885,8 @@ def load_grouped_data(
         train_path = os.path.join(data_dir, "train_grouped_token_ids.pkl")
         holdout_path = os.path.join(data_dir, "holdout_grouped_token_ids.pkl")
     else:
-        train_path = os.path.join(data_dir, "train_grouped.pkl")
-        holdout_path = os.path.join(data_dir, "holdout_grouped.pkl")
+        train_path = os.path.join(data_dir, "train_grouped_final.pkl")
+        holdout_path = os.path.join(data_dir, "holdout_grouped_final.pkl")
     
     # Load train data
     with open(train_path, 'rb') as f:

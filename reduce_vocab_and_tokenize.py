@@ -7,7 +7,7 @@ from typing import Dict, List, Tuple, Iterable, Any
 import math
 
 import torch
-from unsloth import FastModel
+from unsloth import FastLanguageModel
 from transformers import AutoTokenizer, AutoModelForCausalLM
 
 # Local import
@@ -196,7 +196,7 @@ def main() -> None:
     model_dir = "Model"
     _ensure_dir(data_dir)
     _ensure_dir(model_dir)
-    model, tokenizer = FastModel.from_pretrained(
+    model, tokenizer = FastLanguageModel.from_pretrained(
         model_name = model_name_or_path,
         load_in_4bit = True,
     )
